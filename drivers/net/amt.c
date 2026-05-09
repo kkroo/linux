@@ -80,6 +80,14 @@ static struct in6_addr mld2_all_node = MLD2_ALL_NODE_INIT;
 static struct mld2_grec mldv2_zero_grec;
 #endif
 
+/* The outer transport family is fixed at link creation: IFLA_AMT_LOCAL_IP6
+ * selects IPv6, otherwise the device runs over IPv4.
+ */
+static bool amt_v6(const struct amt_dev *amt)
+{
+	return !ipv6_addr_any(&amt->local_ipv6);
+}
+
 static void __amt_source_gc_work(void)
 {
 	struct amt_source_node *snode;
@@ -3002,15 +3010,34 @@ drop:
 	return 0;
 }
 
-static struct sock *amt_create_sock(struct net *net, __be16 port)
+static struct sock *amt_create_sock(struct net *net, __be16 port, bool is_v6)
 {
 	struct udp_port_cfg udp_conf;
 	struct socket *sock;
 	int err;
 
 	memset(&udp_conf, 0, sizeof(udp_conf));
-	udp_conf.family = AF_INET;
-	udp_conf.local_ip.s_addr = htonl(INADDR_ANY);
+	if (is_v6) {
+#if IS_ENABLED(CONFIG_IPV6)
+		udp_conf.family = AF_INET6;
+		udp_conf.local_ip6 = in6addr_any;
+		udp_conf.use_udp6_tx_checksums = true;
+		udp_conf.use_udp6_rx_checksums = true;
+		/* The v6 amt relay netdev is created in PARALLEL with the v4
+		 * one (amtr + amtr6 in the same netns, both on relay_port).
+		 * Without V6ONLY=1 the in6addr_any bind dual-stacks onto
+		 * 0.0.0.0:relay_port too, which the v4 amt netdev's encap
+		 * socket already owns -> EADDRINUSE on netlink RTM_NEWLINK.
+		 * Keep the v6 socket strictly v6 so the two coexist.
+		 */
+		udp_conf.ipv6_v6only = true;
+#else
+		return ERR_PTR(-EAFNOSUPPORT);
+#endif
+	} else {
+		udp_conf.family = AF_INET;
+		udp_conf.local_ip.s_addr = htonl(INADDR_ANY);
+	}
 
 	udp_conf.local_udp_port = port;
 
@@ -3026,7 +3053,7 @@ static int amt_socket_create(struct amt_dev *amt)
 	struct udp_tunnel_sock_cfg tunnel_cfg;
 	struct sock *sk;
 
-	sk = amt_create_sock(amt->net, amt->relay_port);
+	sk = amt_create_sock(amt->net, amt->relay_port, amt_v6(amt));
 	if (IS_ERR(sk))
 		return PTR_ERR(sk);
 
