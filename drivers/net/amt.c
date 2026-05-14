@@ -3520,7 +3520,8 @@ static size_t amt_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(__u32)) + /* IFLA_MAX_TUNNELS */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_DISCOVERY_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_REMOTE_IP */
-	       nla_total_size(sizeof(__be32)); /* IFLA_AMT_LOCAL_IP */
+	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_LOCAL_IP */
+	       nla_total_size(sizeof(struct in6_addr)); /* IFLA_AMT_LOCAL_IP6 */
 }
 
 static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
@@ -3537,8 +3538,22 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_LINK, amt->stream_dev->ifindex))
 		goto nla_put_failure;
-	if (nla_put_in_addr(skb, IFLA_AMT_LOCAL_IP, amt->local_ip))
-		goto nla_put_failure;
+	/* Emit exactly one of LOCAL_IP / LOCAL_IP6 -- whichever family the
+	 * relay was created with. amt_newlink rejects both being set, so
+	 * exactly one is meaningful. Userspace tools (iproute2 `ip -d link
+	 * show`) read the attribute back to decide which family the relay
+	 * is in; if we always emitted LOCAL_IP, a v6 relay would advertise
+	 * local 0.0.0.0 and `ip link` would silently render it as a v4
+	 * relay.
+	 */
+	if (amt_v6(amt)) {
+		if (nla_put_in6_addr(skb, IFLA_AMT_LOCAL_IP6,
+				     &amt->local_ipv6))
+			goto nla_put_failure;
+	} else {
+		if (nla_put_in_addr(skb, IFLA_AMT_LOCAL_IP, amt->local_ip))
+			goto nla_put_failure;
+	}
 	if (nla_put_in_addr(skb, IFLA_AMT_DISCOVERY_IP, amt->discovery_ip))
 		goto nla_put_failure;
 
