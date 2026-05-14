@@ -609,6 +609,75 @@ static void amt_update_relay_status(struct amt_tunnel_list *tunnel,
 	spin_unlock_bh(&tunnel->lock);
 }
 
+#if IS_ENABLED(CONFIG_IPV6)
+static struct dst_entry *amt_route6(struct amt_dev *amt, struct sock *sk,
+				    const struct in6_addr *daddr,
+				    __be16 sport, __be16 dport)
+{
+	struct flowi6 fl6;
+
+	memset(&fl6, 0, sizeof(fl6));
+	fl6.flowi6_oif		= amt->stream_dev->ifindex;
+	fl6.flowi6_proto	= IPPROTO_UDP;
+	fl6.daddr		= *daddr;
+	fl6.saddr		= amt->local_ipv6;
+	fl6.fl6_dport		= dport;
+	fl6.fl6_sport		= sport;
+
+	return ip6_dst_lookup_flow(amt->net, sk, &fl6, NULL);
+}
+
+/* Send an AMT control message over IPv6, with the UDP checksum IPv6 requires.
+ * Returns 0 once the message is handed to the IPv6 stack.
+ */
+static int amt_send_ctrl_v6(struct amt_dev *amt, const struct in6_addr *daddr,
+			    __be16 sport, __be16 dport,
+			    const void *msg, unsigned int len)
+{
+	struct dst_entry *dst;
+	struct sock *sk;
+	struct sk_buff *skb;
+	int hlen, err = 0;
+
+	rcu_read_lock();
+	sk = rcu_dereference(amt->sk);
+	if (!sk || !netif_running(amt->stream_dev) ||
+	    !netif_running(amt->dev)) {
+		err = -ENETDOWN;
+		goto out;
+	}
+
+	dst = amt_route6(amt, sk, daddr, sport, dport);
+	if (IS_ERR(dst)) {
+		amt->dev->stats.tx_errors++;
+		err = PTR_ERR(dst);
+		goto out;
+	}
+
+	hlen = LL_RESERVED_SPACE(amt->dev) + sizeof(struct ipv6hdr) +
+	       sizeof(struct udphdr);
+	skb = netdev_alloc_skb_ip_align(amt->dev, hlen + len +
+					amt->dev->needed_tailroom);
+	if (!skb) {
+		dst_release(dst);
+		amt->dev->stats.tx_errors++;
+		err = -ENOMEM;
+		goto out;
+	}
+
+	skb_reserve(skb, hlen);
+	skb_put_data(skb, msg, len);
+	skb_reset_inner_network_header(skb);
+	skb->priority = TC_PRIO_CONTROL;
+	udp_tunnel6_xmit_skb(dst, sk, skb, amt->dev, &amt->local_ipv6,
+			     daddr, 0, ip6_dst_hoplimit(dst), 0, sport, dport,
+			     false, 0);
+out:
+	rcu_read_unlock();
+	return err;
+}
+#endif
+
 static void amt_send_discovery(struct amt_dev *amt)
 {
 	struct amt_header_discovery *amtd;
@@ -2694,6 +2763,25 @@ out:
 	rcu_read_unlock();
 }
 
+#if IS_ENABLED(CONFIG_IPV6)
+/* IPv6 form of amt_send_advertisement(): the 24-byte Relay Advertisement of
+ * RFC 7450 s5.1.2, carrying the relay's IPv6 address.
+ */
+static void amt_send_advertisement_v6(struct amt_dev *amt, __be32 nonce,
+				      const struct in6_addr *daddr,
+				      __be16 dport)
+{
+	struct amt_header_advertisement_v6 amta = {
+		.type	= AMT_MSG_ADVERTISEMENT,
+		.nonce	= nonce,
+		.ip6	= amt->local_ipv6,
+	};
+
+	amt_send_ctrl_v6(amt, daddr, amt->relay_port, dport,
+			 &amta, sizeof(amta));
+}
+#endif
+
 static bool amt_discovery_handler(struct amt_dev *amt, struct sk_buff *skb)
 {
 	struct amt_header_discovery *amtd;
@@ -2710,6 +2798,14 @@ static bool amt_discovery_handler(struct amt_dev *amt, struct sk_buff *skb)
 	if (amtd->reserved || amtd->version)
 		return true;
 
+#if IS_ENABLED(CONFIG_IPV6)
+	/* The Advertisement form follows the outer IP version (RFC 7450 s5.2). */
+	if (amt_v6(amt)) {
+		amt_send_advertisement_v6(amt, amtd->nonce,
+					  &ipv6_hdr(skb)->saddr, udph->source);
+		return false;
+	}
+#endif
 	amt_send_advertisement(amt, amtd->nonce, iph->saddr, udph->source);
 
 	return false;

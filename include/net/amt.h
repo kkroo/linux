@@ -133,6 +133,31 @@ struct amt_header_advertisement {
 	__be32	ip4;
 } __packed;
 
+/* RFC 7450 §5.1.2 Relay Advertisement message — IPv6 form.
+ *
+ * Same fixed 4-byte header and 4-byte Discovery Nonce as the IPv4
+ * variant (struct amt_header_advertisement above); the trailing
+ * Relay Address field is 16 bytes instead of 4. Total wire size:
+ * 4 + 4 + 16 = 24 bytes. Per §5.2 the form is selected from the
+ * outer IP version, not from any in-header marker, so this is a
+ * separate type rather than a union over amt_header_advertisement.
+ */
+struct amt_header_advertisement_v6 {
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	u32	type:4,
+		version:4,
+		reserved:24;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	u32	version:4,
+		type:4,
+		reserved:24;
+#else
+#error  "Please fix <asm/byteorder.h>"
+#endif
+	__be32		nonce;
+	struct in6_addr	ip6;
+} __packed;
+
 struct amt_header_request {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	u32	type:4,
