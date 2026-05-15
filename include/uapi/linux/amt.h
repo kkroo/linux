@@ -75,6 +75,15 @@ enum {
 	 * up to N groups before the 33rd join is refused with ENOSPC.
 	 */
 	IFLA_AMT_MAX_GROUPS,
+	/* This attribute specifies how many TX/RX queues the amt netdev is
+	 * created with. Default 1 (preserves existing behavior). Larger
+	 * values let the kernel pick distinct txq locks per CPU at
+	 * dev_queue_xmit time, so concurrent multicast-forwarding softirqs
+	 * fanning out to many distinct (S,G) tunnels can encap in parallel
+	 * rather than serializing on a single _xmit_lock. Capped at
+	 * AMT_MAX_QUEUES (the allocation reserves slots up front).
+	 */
+	IFLA_AMT_NUM_QUEUES,
 	__IFLA_AMT_MAX,
 };
 

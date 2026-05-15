@@ -3389,6 +3389,7 @@ static const struct nla_policy amt_policy[IFLA_AMT_MAX + 1] = {
 	[IFLA_AMT_LOCAL_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[IFLA_AMT_HASH_BUCKETS]	= NLA_POLICY_MAX(NLA_U32, 4096),
 	[IFLA_AMT_MAX_GROUPS]	= NLA_POLICY_MAX(NLA_U32, 4096),
+	[IFLA_AMT_NUM_QUEUES]	= NLA_POLICY_MAX(NLA_U32, AMT_MAX_QUEUES),
 };
 
 static int amt_validate(struct nlattr *tb[], struct nlattr *data[],
@@ -3453,6 +3454,7 @@ static int amt_newlink(struct net_device *dev,
 	struct nlattr **data = params->data;
 	struct nlattr **tb = params->tb;
 	int err = -EINVAL;
+	u32 q;
 
 	if (!net_eq(link_net, dev_net(dev)))
 		return err;
@@ -3557,6 +3559,18 @@ static int amt_newlink(struct net_device *dev,
 	}
 	amt->qi = AMT_INIT_QUERY_INTERVAL;
 
+	/* AMT_MAX_QUEUES are allocated (see amt_get_num_queues()), but only
+	 * one runs unless IFLA_AMT_NUM_QUEUES asks for more, so existing
+	 * configurations keep their single-queue behaviour.
+	 */
+	q = nla_get_u32_default(data[IFLA_AMT_NUM_QUEUES], 0) ?: 1;
+	err = netif_set_real_num_tx_queues(dev, q);
+	if (err)
+		goto err;
+	err = netif_set_real_num_rx_queues(dev, q);
+	if (err)
+		goto err;
+
 	err = register_netdevice(dev);
 	if (err < 0) {
 		netdev_dbg(dev, "failed to register new netdev %d\n", err);
@@ -3600,6 +3614,7 @@ static size_t amt_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(__u32)) + /* IFLA_MAX_TUNNELS */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_HASH_BUCKETS */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_MAX_GROUPS */
+	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_NUM_QUEUES */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_DISCOVERY_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_REMOTE_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_LOCAL_IP */
@@ -3649,6 +3664,8 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_MAX_GROUPS, amt->max_groups))
 		goto nla_put_failure;
+	if (nla_put_u32(skb, IFLA_AMT_NUM_QUEUES, dev->real_num_tx_queues))
+		goto nla_put_failure;
 
 	rcu_read_unlock();
 	return 0;
@@ -3656,6 +3673,11 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 nla_put_failure:
 	rcu_read_unlock();
 	return -EMSGSIZE;
+}
+
+static unsigned int amt_get_num_queues(void)
+{
+	return AMT_MAX_QUEUES;
 }
 
 static struct rtnl_link_ops amt_link_ops __read_mostly = {
@@ -3669,6 +3691,9 @@ static struct rtnl_link_ops amt_link_ops __read_mostly = {
 	.dellink	= amt_dellink,
 	.get_size       = amt_get_size,
 	.fill_info      = amt_fill_info,
+	/* Allocate AMT_MAX_QUEUES so amt_newlink() can pick the live count. */
+	.get_num_tx_queues = amt_get_num_queues,
+	.get_num_rx_queues = amt_get_num_queues,
 };
 
 static struct net_device *amt_lookup_upper_dev(struct net_device *dev)

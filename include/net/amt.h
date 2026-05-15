@@ -414,6 +414,13 @@ struct amt_dev {
 #define IANA_AMT_UDP_PORT	2268
 #define AMT_MAX_TUNNELS         128
 #define AMT_MAX_REQS		128
+/* Upper bound on TX/RX queues an amt netdev can be allocated with.
+ * The actual live queue count is set per-link via IFLA_AMT_NUM_QUEUES
+ * with a default of 1 (backwards-compatible). Picked to match a
+ * reasonable upper bound on per-relay parallelism; bigger numbers
+ * just waste alloc memory (a few hundred bytes per reserved slot).
+ */
+#define AMT_MAX_QUEUES		32
 #define AMT_GW_HLEN (sizeof(struct iphdr) + \
 		     sizeof(struct udphdr) + \
 		     sizeof(struct amt_gw_headers))
