@@ -8,6 +8,7 @@
 #include <linux/siphash.h>
 #include <linux/jhash.h>
 #include <linux/netdevice.h>
+#include <linux/rhashtable.h>
 #include <net/gro_cells.h>
 #include <net/rtnetlink.h>
 
@@ -282,7 +283,8 @@ struct amt_tunnel_list {
 	u64			mac:48,
 				reserved:16;
 	struct rcu_head		rcu;
-	struct hlist_head	groups[];
+	/* This tunnel's entries in amt->groups_rhl, under lock */
+	struct list_head	groups;
 };
 
 /* RFC 3810
@@ -316,13 +318,19 @@ struct amt_source_node {
 /* Protected by amt_tunnel_list->lock */
 struct amt_group_node {
 	struct amt_dev		*amt;
-	union amt_addr		group_addr;
+	/* Key in amt->groups_rhl; the hosts that joined a group through
+	 * one tunnel share a key.
+	 */
+	struct_group_tagged(amt_gnode_key, key,
+		struct amt_tunnel_list	*tunnel_list;
+		union amt_addr		group_addr;
+		bool			v6;
+	);
 	union amt_addr		host_addr;
-	bool			v6;
 	u8			filter_mode;
 	u32			nr_sources;
-	struct amt_tunnel_list	*tunnel_list;
-	struct hlist_node	node;
+	struct list_head	tunnel_node;
+	struct rhlist_head	rhlnode;
 	struct delayed_work     group_timer;
 	struct rcu_head		rcu;
 	struct hlist_head	sources[];
@@ -342,6 +350,8 @@ struct amt_dev {
 	spinlock_t		lock;
 	/* Used only in relay mode */
 	struct list_head        tunnel_list;
+	/* Groups joined through any tunnel, keyed by amt_gnode_key */
+	struct rhltable		groups_rhl;
 	struct gro_cells	gro_cells;
 
 	/* Protected by RTNL */

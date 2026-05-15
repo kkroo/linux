@@ -134,7 +134,7 @@ static void amt_source_gc_work(struct work_struct *work)
 	spin_unlock_bh(&source_gc_lock);
 }
 
-static bool amt_addr_equal(union amt_addr *a, union amt_addr *b)
+static bool amt_addr_equal(const union amt_addr *a, const union amt_addr *b)
 {
 	return !memcmp(a, b, sizeof(union amt_addr));
 }
@@ -216,25 +216,30 @@ static struct amt_source_node *amt_lookup_src(struct amt_tunnel_list *tunnel,
 	return NULL;
 }
 
-static u32 amt_group_hash(struct amt_tunnel_list *tunnel, union amt_addr *group)
-{
-	u32 hash = jhash(group, sizeof(*group), tunnel->amt->hash_seed);
-
-	return reciprocal_scale(hash, tunnel->amt->hash_buckets);
-}
+static const struct rhashtable_params amt_gnode_params = {
+	.head_offset		= offsetof(struct amt_group_node, rhlnode),
+	.key_offset		= offsetof(struct amt_group_node, key),
+	.key_len		= offsetofend(struct amt_gnode_key, v6),
+	.automatic_shrinking	= true,
+};
 
 static struct amt_group_node *amt_lookup_group(struct amt_tunnel_list *tunnel,
 					       union amt_addr *group,
 					       union amt_addr *host,
 					       bool v6)
 {
-	u32 hash = amt_group_hash(tunnel, group);
+	struct amt_gnode_key key = {
+		.tunnel_list	= tunnel,
+		.group_addr	= *group,
+		.v6		= v6,
+	};
 	struct amt_group_node *gnode;
+	struct rhlist_head *list, *pos;
 
-	hlist_for_each_entry_rcu(gnode, &tunnel->groups[hash], node) {
-		if (amt_addr_equal(&gnode->group_addr, group) &&
-		    amt_addr_equal(&gnode->host_addr, host) &&
-		    gnode->v6 == v6)
+	list = rhltable_lookup(&tunnel->amt->groups_rhl, &key,
+			       amt_gnode_params);
+	rhl_for_each_entry_rcu(gnode, pos, list, rhlnode) {
+		if (amt_addr_equal(&gnode->host_addr, host))
 			return gnode;
 	}
 
@@ -279,7 +284,8 @@ static void amt_del_group(struct amt_dev *amt, struct amt_group_node *gnode)
 
 	if (cancel_delayed_work(&gnode->group_timer))
 		dev_put(amt->dev);
-	hlist_del_rcu(&gnode->node);
+	rhltable_remove(&amt->groups_rhl, &gnode->rhlnode, amt_gnode_params);
+	list_del(&gnode->tunnel_node);
 	gnode->tunnel_list->nr_groups--;
 
 	if (!gnode->v6)
@@ -488,7 +494,7 @@ static struct amt_group_node *amt_add_group(struct amt_dev *amt,
 					    bool v6)
 {
 	struct amt_group_node *gnode;
-	u32 hash;
+	int err;
 	int i;
 
 	if (tunnel->nr_groups >= amt->max_groups)
@@ -506,13 +512,17 @@ static struct amt_group_node *amt_add_group(struct amt_dev *amt,
 	gnode->v6 = v6;
 	gnode->tunnel_list = tunnel;
 	gnode->filter_mode = MCAST_INCLUDE;
-	INIT_HLIST_NODE(&gnode->node);
 	INIT_DELAYED_WORK(&gnode->group_timer, amt_group_work);
 	for (i = 0; i < amt->hash_buckets; i++)
 		INIT_HLIST_HEAD(&gnode->sources[i]);
 
-	hash = amt_group_hash(tunnel, group);
-	hlist_add_head_rcu(&gnode->node, &tunnel->groups[hash]);
+	err = rhltable_insert(&amt->groups_rhl, &gnode->rhlnode,
+			      amt_gnode_params);
+	if (err) {
+		kfree(gnode);
+		return ERR_PTR(err);
+	}
+	list_add(&gnode->tunnel_node, &tunnel->groups);
 	tunnel->nr_groups++;
 
 	if (!gnode->v6)
@@ -1297,8 +1307,8 @@ static netdev_tx_t amt_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct amt_dev *amt = netdev_priv(dev);
 	struct amt_tunnel_list *tunnel;
-	struct amt_group_node *gnode;
 	union amt_addr group = {0,};
+	struct amt_gnode_key key;
 #if IS_ENABLED(CONFIG_IPV6)
 	struct ipv6hdr *ip6h;
 	struct mld_msg *mld;
@@ -1308,7 +1318,6 @@ static netdev_tx_t amt_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct iphdr *iph;
 	bool data = false;
 	bool v6 = false;
-	u32 hash;
 
 	iph = ip_hdr(skb);
 	if (iph->version == 4) {
@@ -1383,24 +1392,14 @@ static netdev_tx_t amt_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	} else if (amt->mode == AMT_MODE_RELAY) {
 		if (!data)
 			goto free;
+		key.group_addr = group;
+		key.v6 = v6;
 		list_for_each_entry_rcu(tunnel, &amt->tunnel_list, list) {
-			hash = amt_group_hash(tunnel, &group);
-			hlist_for_each_entry_rcu(gnode, &tunnel->groups[hash],
-						 node) {
-				if (!v6) {
-					if (gnode->group_addr.ip4 == group.ip4)
-						goto found;
-#if IS_ENABLED(CONFIG_IPV6)
-				} else {
-					if (ipv6_addr_equal(&gnode->group_addr.ip6,
-							    &group.ip6))
-						goto found;
-#endif
-				}
-			}
-			continue;
-found:
-			amt_send_multicast_data(amt, skb, tunnel, v6);
+			/* One copy per tunnel, however many hosts joined. */
+			key.tunnel_list = tunnel;
+			if (rhltable_lookup(&amt->groups_rhl, &key,
+					    amt_gnode_params))
+				amt_send_multicast_data(amt, skb, tunnel, v6);
 		}
 	}
 
@@ -1434,15 +1433,12 @@ static int amt_parse_type(struct sk_buff *skb)
 static void amt_clear_groups(struct amt_tunnel_list *tunnel)
 {
 	struct amt_dev *amt = tunnel->amt;
-	struct amt_group_node *gnode;
-	struct hlist_node *t;
-	int i;
+	struct amt_group_node *gnode, *t;
 
 	spin_lock_bh(&tunnel->lock);
 	rcu_read_lock();
-	for (i = 0; i < amt->hash_buckets; i++)
-		hlist_for_each_entry_safe(gnode, t, &tunnel->groups[i], node)
-			amt_del_group(amt, gnode);
+	list_for_each_entry_safe(gnode, t, &tunnel->groups, tunnel_node)
+		amt_del_group(amt, gnode);
 	rcu_read_unlock();
 	spin_unlock_bh(&tunnel->lock);
 }
@@ -2860,7 +2856,6 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 	union amt_addr saddr;
 	struct udphdr *udph;
 	u64 mac;
-	int i;
 
 	if (!pskb_may_pull(skb, sizeof(*udph) + sizeof(*amtrh)))
 		return true;
@@ -2915,9 +2910,7 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 		return true;
 	}
 
-	tunnel = kzalloc(sizeof(*tunnel) +
-			 (sizeof(struct hlist_head) * amt->hash_buckets),
-			 GFP_ATOMIC);
+	tunnel = kzalloc(sizeof(*tunnel), GFP_ATOMIC);
 	if (!tunnel) {
 		spin_unlock_bh(&amt->lock);
 		return true;
@@ -2929,8 +2922,7 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 	memcpy(&key, &tunnel->key, sizeof(unsigned long long));
 	tunnel->amt = amt;
 	spin_lock_init(&tunnel->lock);
-	for (i = 0; i < amt->hash_buckets; i++)
-		INIT_HLIST_HEAD(&tunnel->groups[i]);
+	INIT_LIST_HEAD(&tunnel->groups);
 
 	INIT_DELAYED_WORK(&tunnel->gc_wq, amt_tunnel_expire);
 
@@ -3335,6 +3327,15 @@ static int amt_dev_init(struct net_device *dev)
 	if (err)
 		return err;
 
+	/* One table for every tunnel's groups, sized here in process context:
+	 * tunnels are created from softirq, where rhltable_init() cannot run.
+	 */
+	err = rhltable_init(&amt->groups_rhl, &amt_gnode_params);
+	if (err) {
+		gro_cells_destroy(&amt->gro_cells);
+		return err;
+	}
+
 	return 0;
 }
 
@@ -3342,6 +3343,8 @@ static void amt_dev_uninit(struct net_device *dev)
 {
 	struct amt_dev *amt = netdev_priv(dev);
 
+	/* amt_dev_stop() has removed every tunnel and its groups. */
+	rhltable_destroy(&amt->groups_rhl);
 	gro_cells_destroy(&amt->gro_cells);
 }
 

@@ -62,10 +62,9 @@ enum {
 	 */
 	IFLA_AMT_LOCAL_IP6,
 	/* This attribute specifies the number of hash buckets in each
-	 * tunnel's group table and in each group's source table. Zero or
-	 * absent selects the default, AMT_HSIZE (256). Each bucket costs a
-	 * struct hlist_head, allocated per tunnel and per group, so larger
-	 * values trade memory for shorter lookup chains.
+	 * group's source table. Zero or absent selects the default,
+	 * AMT_HSIZE (256). Each bucket costs a struct hlist_head, allocated
+	 * per group, so larger values trade memory for shorter lookup chains.
 	 */
 	IFLA_AMT_HASH_BUCKETS,
 	/* This attribute specifies the maximum number of multicast groups a
