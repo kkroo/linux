@@ -3387,6 +3387,8 @@ static const struct nla_policy amt_policy[IFLA_AMT_MAX + 1] = {
 	[IFLA_AMT_DISCOVERY_IP]	= { .len = sizeof_field(struct iphdr, daddr) },
 	[IFLA_AMT_MAX_TUNNELS]	= { .type = NLA_U32 },
 	[IFLA_AMT_LOCAL_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+	[IFLA_AMT_HASH_BUCKETS]	= NLA_POLICY_MAX(NLA_U32, 4096),
+	[IFLA_AMT_MAX_GROUPS]	= NLA_POLICY_MAX(NLA_U32, 4096),
 };
 
 static int amt_validate(struct nlattr *tb[], struct nlattr *data[],
@@ -3465,9 +3467,12 @@ static int amt_newlink(struct net_device *dev,
 		amt->max_tunnels = AMT_MAX_TUNNELS;
 
 	spin_lock_init(&amt->lock);
-	amt->max_groups = AMT_MAX_GROUP;
+	/* Zero means the default for both, as for IFLA_AMT_MAX_TUNNELS. */
+	amt->max_groups = nla_get_u32_default(data[IFLA_AMT_MAX_GROUPS], 0) ?:
+			  AMT_MAX_GROUP;
 	amt->max_sources = AMT_MAX_SOURCE;
-	amt->hash_buckets = AMT_HSIZE;
+	amt->hash_buckets = nla_get_u32_default(data[IFLA_AMT_HASH_BUCKETS], 0) ?:
+			    AMT_HSIZE;
 	amt->nr_tunnels = 0;
 	get_random_bytes(&amt->hash_seed, sizeof(amt->hash_seed));
 	amt->stream_dev = dev_get_by_index(link_net,
@@ -3593,6 +3598,8 @@ static size_t amt_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(__u16)) + /* IFLA_AMT_GATEWAY_PORT */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_LINK */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_MAX_TUNNELS */
+	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_HASH_BUCKETS */
+	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_MAX_GROUPS */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_DISCOVERY_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_REMOTE_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_LOCAL_IP */
@@ -3637,6 +3644,10 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		if (nla_put_in_addr(skb, IFLA_AMT_REMOTE_IP, remote_ip))
 			goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_MAX_TUNNELS, amt->max_tunnels))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, IFLA_AMT_HASH_BUCKETS, amt->hash_buckets))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, IFLA_AMT_MAX_GROUPS, amt->max_groups))
 		goto nla_put_failure;
 
 	rcu_read_unlock();

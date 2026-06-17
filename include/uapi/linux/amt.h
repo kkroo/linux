@@ -61,6 +61,20 @@ enum {
 	 * today; v6 gateway support is out of scope.
 	 */
 	IFLA_AMT_LOCAL_IP6,
+	/* This attribute specifies the number of hash buckets in each
+	 * tunnel's group table and in each group's source table. Zero or
+	 * absent selects the default, AMT_HSIZE (256). Each bucket costs a
+	 * struct hlist_head, allocated per tunnel and per group, so larger
+	 * values trade memory for shorter lookup chains.
+	 */
+	IFLA_AMT_HASH_BUCKETS,
+	/* This attribute specifies the maximum number of multicast groups a
+	 * single gateway may aggregate behind one tunnel. Default
+	 * AMT_MAX_GROUP (32). Client-edge boxes serving many channels can
+	 * exceed this; raising the cap permits a single gateway to join
+	 * up to N groups before the 33rd join is refused with ENOSPC.
+	 */
+	IFLA_AMT_MAX_GROUPS,
 	__IFLA_AMT_MAX,
 };
 
