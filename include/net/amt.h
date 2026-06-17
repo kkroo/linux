@@ -256,6 +256,13 @@ struct amt_relay_headers {
 	};
 } __packed;
 
+union amt_addr {
+	__be32			ip4;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct in6_addr		ip6;
+#endif
+};
+
 struct amt_tunnel_list {
 	struct list_head	list;
 	/* Protect All resources under an amt_tunne_list */
@@ -266,20 +273,16 @@ struct amt_tunnel_list {
 	enum amt_status		status;
 	struct delayed_work	gc_wq;
 	__be16			source_port;
-	__be32			ip4;
+	/* Outer source address of the gateway endpoint, in the device's
+	 * outer family (amt_v6()).
+	 */
+	union amt_addr		addr;
 	__be32			nonce;
 	siphash_key_t		key;
 	u64			mac:48,
 				reserved:16;
 	struct rcu_head		rcu;
 	struct hlist_head	groups[];
-};
-
-union amt_addr {
-	__be32			ip4;
-#if IS_ENABLED(CONFIG_IPV6)
-	struct in6_addr		ip6;
-#endif
 };
 
 /* RFC 3810
