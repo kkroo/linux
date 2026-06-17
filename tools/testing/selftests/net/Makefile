@@ -10,6 +10,7 @@ TEST_PROGS := \
 	altnames.sh \
 	amt.sh \
 	amt_v6.sh \
+	amt_scale.sh \
 	arp_ndisc_evict_nocarrier.sh \
 	arp_ndisc_untracked_subnets.sh \
 	bareudp.sh \
