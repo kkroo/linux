@@ -54,6 +54,13 @@ enum {
 	IFLA_AMT_DISCOVERY_IP,
 	/* This attribute specify number of maximum tunnel. */
 	IFLA_AMT_MAX_TUNNELS,
+	/* This attribute specify the local IPv6 address used by the relay
+	 * for AMT Discovery / Advertisement (RFC 7450 §5.1.2 v6 form).
+	 * Mutually exclusive with IFLA_AMT_LOCAL_IP — exactly one must be
+	 * supplied at link creation. Gateway-mode only uses IFLA_AMT_LOCAL_IP
+	 * today; v6 gateway support is out of scope.
+	 */
+	IFLA_AMT_LOCAL_IP6,
 	__IFLA_AMT_MAX,
 };
 
