@@ -7,6 +7,7 @@
 
 #include <linux/siphash.h>
 #include <linux/jhash.h>
+#include <linux/hashtable.h>
 #include <linux/netdevice.h>
 #include <linux/rhashtable.h>
 #include <net/gro_cells.h>
@@ -264,6 +265,32 @@ union amt_addr {
 #endif
 };
 
+/* Upstream IGMPv3 / MLDv2 host-stack membership state. Sized for production
+ * relay scale (thousands of active (S, G) tuples possible).
+ */
+#define AMT_UPSTREAM_HASH_BITS	10
+
+/* One (S, G) of upstream interest. `want` is the DESIRED state: the
+ * number of source nodes currently contributing interest (many gateways
+ * may join the same (S, G)). `joined` is the ACTUAL state: whether the
+ * kernel host stack currently holds the membership on the stream
+ * socket. The reconciler worker converges joined toward (want > 0);
+ * both fields are protected by amt->upstream_lock. Entries are freed
+ * only by the reconciler (and the destructor, strictly after the
+ * worker is cancelled), so the reconciler may drop upstream_lock
+ * around the sleeping setsockopt while holding an entry pointer.
+ */
+struct amt_upstream_entry {
+	struct hlist_node	node;
+	union amt_addr		group;
+	union amt_addr		source;
+	bool			v6;
+	bool			joined;
+	int			want;
+};
+
+enum amt_upstream_op { AMT_UPSTREAM_JOIN, AMT_UPSTREAM_LEAVE };
+
 struct amt_tunnel_list {
 	struct list_head	list;
 	/* Protect All resources under an amt_tunne_list */
@@ -312,6 +339,16 @@ struct amt_source_node {
 #define AMT_SOURCE_OLD	0
 #define AMT_SOURCE_NEW	1
 	u8			flags;
+	/* Whether this source node currently contributes one count of
+	 * upstream host-stack (S, G) interest (amt_upstream_entry.want).
+	 * Set at most once per node lifetime on the first FWD_NEW while
+	 * the group is INCLUDE; cleared exactly once when the node is
+	 * destroyed. Makes the per-report FWD_NEW re-mark of surviving
+	 * sources idempotent and pairs every recorded join with exactly
+	 * one release, regardless of the group's filter mode at release
+	 * time.
+	 */
+	bool			upstream_joined;
 	struct rcu_head		rcu;
 };
 
@@ -404,6 +441,37 @@ struct amt_dev {
 	struct amt_events	events[AMT_MAX_EVENTS];
 	u8			event_idx;
 	u8			nr_events;
+
+	/* Upstream IGMPv3/MLDv2 host-stack membership state (relay mode).
+	 *
+	 * Relay mode mirrors gateway (S, G) interest as host-stack
+	 * memberships on the underlying stream_dev via setsockopt on
+	 * stream_sock_v{4,6}. The upstream table records DESIRED interest
+	 * (amt_upstream_entry.want, one count per contributing source
+	 * node) next to ACTUAL host-stack state (.joined); upstream_work
+	 * is a reconciler that converges actual toward desired in process
+	 * context, so the rtnl_lock taken internally by the IGMP/MLD
+	 * setsockopt paths (on the kernels we target) is never nested
+	 * inside a caller-held lock. A failed emit leaves the entry
+	 * unconverged and arms a delayed retry.
+	 *
+	 * upstream_lock protects the table; it is bh because desired
+	 * state changes arrive from the softirq decap path. The
+	 * reconciler is the only context that frees entries (destructor
+	 * aside, which runs strictly after the work is cancelled), so it
+	 * may drop upstream_lock around the sleeping setsockopt while
+	 * holding an entry pointer. upstream_active tracks whether
+	 * stream_dev is usable (cleared on NETDEV_DOWN, set on open/UP);
+	 * it pauses reconciliation but never desired-state recording, so
+	 * releases during a down window or device stop are not lost.
+	 */
+	spinlock_t		upstream_lock;
+	DECLARE_HASHTABLE(upstream, AMT_UPSTREAM_HASH_BITS);
+	bool			upstream_active;
+	struct delayed_work	upstream_work;
+	struct socket		*stream_sock_v4;
+	struct socket		*stream_sock_v6;
+	atomic_t		upstream_setsockopt_slow_count;
 };
 
 #define AMT_TOS			0xc0

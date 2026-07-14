@@ -246,12 +246,31 @@ static struct amt_group_node *amt_lookup_group(struct amt_tunnel_list *tunnel,
 	return NULL;
 }
 
+/* Forward declaration: amt_upstream_track is defined later (after the
+ * desired-state + reconciler helpers it depends on), but
+ * amt_destroy_source and amt_act_src need to call it. The function body
+ * lives at the bottom of the upstream-membership block.
+ */
+static void amt_upstream_track(struct amt_dev *amt,
+			       struct amt_group_node *gnode,
+			       struct amt_source_node *snode, bool join);
+
 static void amt_destroy_source(struct amt_source_node *snode)
 {
 	struct amt_group_node *gnode = snode->gnode;
 	struct amt_tunnel_list *tunnel;
 
 	tunnel = gnode->tunnel_list;
+
+	/* Release this node's upstream host-stack contribution (no-op
+	 * unless it joined). Centralised at the single destroy chokepoint
+	 * so every teardown path -- state-machine pruning
+	 * (amt_cleanup_srcs), source ageing (amt_source_work), group-timer
+	 * reaping (amt_group_work), and group teardown (amt_del_group) --
+	 * pairs the join recorded at FWD_NEW time exactly once, including
+	 * for sources destroyed after the group flipped to EXCLUDE.
+	 */
+	amt_upstream_track(gnode->amt, gnode, snode, false);
 
 	if (!gnode->v6) {
 		netdev_dbg(snode->gnode->amt->dev,
@@ -359,6 +378,7 @@ static void amt_act_src(struct amt_tunnel_list *tunnel,
 	case AMT_ACT_STATUS_FWD_NEW:
 		snode->status = AMT_SOURCE_STATUS_FWD;
 		snode->flags = AMT_SOURCE_NEW;
+		amt_upstream_track(amt, gnode, snode, true);
 		break;
 	case AMT_ACT_STATUS_D_FWD_NEW:
 		snode->status = AMT_SOURCE_STATUS_D_FWD;
@@ -368,6 +388,15 @@ static void amt_act_src(struct amt_tunnel_list *tunnel,
 		cancel_delayed_work(&snode->source_timer);
 		snode->status = AMT_SOURCE_STATUS_NONE;
 		snode->flags = AMT_SOURCE_NEW;
+		/* No upstream release here. NONE/NEW is scratch state: its
+		 * only producer is the is_in EXCLUDE branch's mark-sweep,
+		 * which re-marks every marked source FWD_NEW in the same
+		 * critical section. Releasing on the mark would drop an
+		 * INCLUDE-era join that the re-mark cannot restore (the
+		 * join path is INCLUDE-gated while the group is EXCLUDE).
+		 * A source whose forwarding truly ends is destroyed, and
+		 * amt_destroy_source carries the release.
+		 */
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -469,6 +498,13 @@ static void amt_group_work(struct work_struct *work)
 	if (delete_group)
 		amt_del_group(amt, gnode);
 	else
+		/* Surviving EXCLUDE-era sources become INCLUDE forwarding
+		 * sources here without a recorded upstream join (the join
+		 * path was gated while EXCLUDE). That is deliberate: the
+		 * next current-state report re-marks them FWD_NEW with
+		 * filter_mode now INCLUDE, which records the join; a
+		 * source the gateway never re-reports ages out instead.
+		 */
 		gnode->filter_mode = MCAST_INCLUDE;
 	rcu_read_unlock();
 	spin_unlock_bh(&tunnel->lock);
@@ -3233,6 +3269,11 @@ static int amt_socket_create(struct amt_dev *amt)
 	return 0;
 }
 
+/* Defined further down (next to amt_dev_init). Forward-declared here so
+ * amt_dev_open can wire it without reordering the file.
+ */
+static void amt_upstream_setup_open(struct amt_dev *amt);
+
 static int amt_dev_open(struct net_device *dev)
 {
 	struct amt_dev *amt = netdev_priv(dev);
@@ -3263,6 +3304,10 @@ static int amt_dev_open(struct net_device *dev)
 		mod_delayed_work(amt_wq, &amt->discovery_wq, 0);
 		mod_delayed_work(amt_wq, &amt->req_wq, 0);
 	} else if (amt->mode == AMT_MODE_RELAY) {
+		/* Relay-only: gateway-mode devices never signal upstream
+		 * interest, so they get no membership sockets.
+		 */
+		amt_upstream_setup_open(amt); /* non-fatal */
 		mod_delayed_work(amt_wq, &amt->secret_wq,
 				 msecs_to_jiffies(AMT_SECRET_TIMEOUT));
 	}
@@ -3277,6 +3322,7 @@ static int amt_dev_stop(struct net_device *dev)
 	struct sock *sk;
 	int i;
 
+	/* No upstream fence here: tunnel teardown releases host memberships. */
 	disable_delayed_work_sync(&amt->req_wq);
 	disable_delayed_work_sync(&amt->discovery_wq);
 	cancel_delayed_work_sync(&amt->secret_wq);
@@ -3312,8 +3358,473 @@ static int amt_dev_stop(struct net_device *dev)
 	return 0;
 }
 
+/* Forward declaration: full definition near upstream_setsockopt_slow_count_show
+ * (where its attrs are defined). Wired into amt_type::groups below so the
+ * sysfs entries are auto-created at device_add() (inside register_netdevice)
+ * and auto-removed at device_del() (inside unregister_netdevice). Explicit
+ * sysfs_create_group/sysfs_remove_group are race-prone: priv_destructor runs
+ * AFTER device_del has nulled kobj->sd, so sysfs_remove_group there OOPSes
+ * dereferencing a NULL parent kernfs_node. Letting device_type::groups own
+ * lifetime matches vxlan/geneve and the rest of the netdev tree.
+ */
+static const struct attribute_group amt_upstream_group;
+
+static const struct attribute_group *amt_groups[] = {
+	&amt_upstream_group,
+	NULL,
+};
+
 static const struct device_type amt_type = {
 	.name = "amt",
+	.groups = amt_groups,
+};
+
+/* Upstream IGMPv3/MLDv2 host-stack membership: a desired-state table +
+ * a reconciler.
+ *
+ * The relay decap path delivers gateway Membership Updates that need to
+ * be mirrored as host-stack joins/leaves on the underlying stream_dev
+ * so the kernel's existing IGMP/MLD state machine drives the on-wire
+ * IGMPv3/MLDv2 reports. Many gateways may join the same (S, G), so
+ * desired interest is counted per (group, source) -- one count per
+ * contributing source node (entry->want) -- next to the actual
+ * host-stack state (entry->joined). amt_upstream_reconcile() converges
+ * actual toward desired in process context; the recording side never
+ * sleeps and never calls setsockopt itself. IPv4 and IPv6 entries share
+ * one table, told apart by entry->v6.
+ *
+ * Locking: upstream_lock is taken with spin_lock_bh() because desired
+ * state changes arrive from softirq (gateway decap) as well as process
+ * context. The reconciler drops the lock around the sleeping
+ * setsockopt; that is safe because it is the only context that frees
+ * entries (the destructor runs strictly after the work is cancelled).
+ */
+static u32 amt_upstream_hash(const struct amt_dev *amt,
+			     const union amt_addr *grp,
+			     const union amt_addr *src)
+{
+	return jhash(src, sizeof(*src),
+		     jhash(grp, sizeof(*grp), amt->hash_seed));
+}
+
+/* Caller holds amt->upstream_lock. */
+static struct amt_upstream_entry *
+amt_upstream_find(struct amt_dev *amt, const union amt_addr *grp,
+		  const union amt_addr *src, bool v6)
+{
+	struct amt_upstream_entry *e;
+
+	hash_for_each_possible(amt->upstream, e, node,
+			       amt_upstream_hash(amt, grp, src))
+		if (e->v6 == v6 && amt_addr_equal(&e->group, grp) &&
+		    amt_addr_equal(&e->source, src))
+			return e;
+	return NULL;
+}
+
+/* Ask the reconciler to run now. mod_delayed_work (not queue) so a
+ * pending retry backoff is pulled forward on fresh desired-state
+ * changes. Safe from softirq. Re-arming while the work is executing
+ * queues a follow-up pass, so a change that lands behind the
+ * reconciler's walk cursor is never lost.
+ */
+static void amt_upstream_kick(struct amt_dev *amt)
+{
+	mod_delayed_work(amt_wq, &amt->upstream_work, 0);
+}
+
+/* Record a desired-state change: delta is +1/-1 counts of interest in
+ * (grp, src). Never frees entries and never emits -- the reconciler
+ * owns both. Returns -ENOMEM when a new entry cannot be allocated (the
+ * caller leaves its source node unmarked, so the state machine's next
+ * FWD_NEW re-mark of that source retries), 0 otherwise.
+ */
+static int amt_upstream_adjust(struct amt_dev *amt, const union amt_addr *grp,
+			       const union amt_addr *src, bool v6, int delta)
+{
+	struct amt_upstream_entry *e;
+	bool kick;
+
+	spin_lock_bh(&amt->upstream_lock);
+	e = amt_upstream_find(amt, grp, src, v6);
+	if (!e) {
+		if (delta < 0) {
+			/* Release without a recorded join: nothing to do. */
+			spin_unlock_bh(&amt->upstream_lock);
+			return 0;
+		}
+		e = kzalloc_obj(*e, GFP_ATOMIC);
+		if (!e) {
+			spin_unlock_bh(&amt->upstream_lock);
+			return -ENOMEM;
+		}
+		e->group = *grp;
+		e->source = *src;
+		e->v6 = v6;
+		hash_add(amt->upstream, &e->node,
+			 amt_upstream_hash(amt, grp, src));
+	}
+	e->want += delta;
+	if (WARN_ON_ONCE(e->want < 0))
+		e->want = 0;
+	kick = (e->want > 0) != e->joined;
+	spin_unlock_bh(&amt->upstream_lock);
+
+	if (kick)
+		amt_upstream_kick(amt);
+	return 0;
+}
+
+/*
+ * Create a kernel-only UDP socket in amt->net, bind it to stream_dev by
+ * ifindex, and store it in *out. SO_BINDTOIFINDEX (sock_bindtoindex) is
+ * preferred over snapshotting an IP because the stream_dev's address may
+ * change at runtime; the ifindex is stable for the lifetime of the
+ * underlying netdev.
+ *
+ * The socket is used solely to carry IGMPv3/MLDv2 host-stack memberships
+ * via setsockopt(MCAST_JOIN_SOURCE_GROUP) — it never sends or receives
+ * data directly.
+ */
+static int amt_upstream_sock_create(struct amt_dev *amt, int family,
+				    struct socket **out)
+{
+	struct socket *sock;
+	int err;
+
+	err = sock_create_kern(amt->net, family, SOCK_DGRAM, IPPROTO_UDP, &sock);
+	if (err < 0)
+		return err;
+
+	err = sock_bindtoindex(sock->sk, amt->stream_dev->ifindex, true);
+	if (err < 0) {
+		sock_release(sock);
+		return err;
+	}
+
+	WRITE_ONCE(*out, sock);
+	return 0;
+}
+
+static void amt_upstream_sockaddr(struct __kernel_sockaddr_storage *ss,
+				  const union amt_addr *addr, bool v6)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (v6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_addr = addr->ip6;
+		return;
+	}
+#endif
+	((struct sockaddr_in *)ss)->sin_family = AF_INET;
+	((struct sockaddr_in *)ss)->sin_addr.s_addr = addr->ip4;
+}
+
+/*
+ * Emit a single IGMPv3/MLDv2 state-change on stream_dev via the kernel
+ * host stack. MCAST_JOIN_SOURCE_GROUP / MCAST_LEAVE_SOURCE_GROUP name the
+ * interface by ifindex at both IPPROTO_IP and IPPROTO_IPV6, so one path
+ * serves both families.
+ *
+ * Lifecycle invariant: sockets persist across stop/start cycles. They
+ * are created in amt_dev_open (only if NULL) and released ONLY in
+ * amt_dev_destructor (post-rtnl). sock_release of an IGMP/MLD
+ * membership-carrying UDP sock acquires rtnl_lock inside
+ * ip_mc_drop_socket / ipv6_sock_mc_close on the kernels we target
+ * (verified against v6.8 and v6.18); releasing under amt_dev_stop's
+ * rtnl would recurse, and deferring to the post-rtnl destructor is
+ * harmless on kernels where those paths no longer take rtnl.
+ *
+ * The socket used here is kept alive purely by ordering: this
+ * function's only caller is the reconciler work item, and the
+ * destructor does cancel_delayed_work_sync BEFORE releasing the
+ * sockets. Any future non-worker caller must add its own lifetime
+ * guarantee.
+ */
+static int amt_upstream_emit(struct amt_dev *amt, bool v6,
+			     const union amt_addr *grp,
+			     const union amt_addr *src,
+			     enum amt_upstream_op op)
+{
+	struct net_device *sdev = amt->stream_dev;
+	struct group_source_req gsr = {};
+	struct socket *sock;
+	int optname, rc;
+	ktime_t t0;
+	u64 ns;
+
+	if (!sdev || !READ_ONCE(amt->upstream_active))
+		return -ESHUTDOWN;
+
+	sock = v6 ? READ_ONCE(amt->stream_sock_v6) :
+		    READ_ONCE(amt->stream_sock_v4);
+	if (!sock)
+		return -ENODEV;
+
+	gsr.gsr_interface = sdev->ifindex;
+	amt_upstream_sockaddr(&gsr.gsr_group, grp, v6);
+	amt_upstream_sockaddr(&gsr.gsr_source, src, v6);
+	optname = (op == AMT_UPSTREAM_JOIN) ? MCAST_JOIN_SOURCE_GROUP
+					    : MCAST_LEAVE_SOURCE_GROUP;
+
+	t0 = ktime_get();
+	rc = sock->ops->setsockopt(sock, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
+				   optname, KERNEL_SOCKPTR(&gsr), sizeof(gsr));
+	ns = ktime_to_ns(ktime_sub(ktime_get(), t0));
+	if (unlikely(ns > 1000ULL * NSEC_PER_MSEC)) {
+		atomic_inc(&amt->upstream_setsockopt_slow_count);
+		net_ratelimited_function(netdev_warn, amt->dev,
+					 "upstream: %s setsockopt(%s) took %llu ms, possible rtnl contention\n",
+					 v6 ? "v6" : "v4",
+					 op == AMT_UPSTREAM_JOIN ? "JOIN" : "LEAVE",
+					 ns / NSEC_PER_MSEC);
+	}
+	return rc;
+}
+
+/* -ESHUTDOWN (sockets torn down) is an expected transient on the retry
+ * path; anything else is worth a ratelimited warn. On v4, -ENOBUFS means
+ * the per-socket source-filter cap -- name the sysctl the admin can
+ * raise.
+ */
+static void amt_upstream_warn_reconcile(struct amt_dev *amt, bool v6,
+					enum amt_upstream_op op, int err)
+{
+	if (err == -ESHUTDOWN)
+		return;
+	net_ratelimited_function(netdev_warn, amt->dev,
+				 "upstream: %s %s reconcile failed (%d)%s; will retry\n",
+				 v6 ? "v6" : "v4",
+				 op == AMT_UPSTREAM_JOIN ? "JOIN" : "LEAVE", err,
+				 err == -ENOBUFS && !v6 ?
+				 " -- consider raising net.ipv4.igmp_max_msf" : "");
+}
+
+/* Retry classes for the reconcile walk. FAST covers transients
+ * (allocation pressure, a stream_dev that is not ready yet) worth a 1s
+ * retry. SLOW covers administrative failures -- the per-socket
+ * source-filter cap (-ENOBUFS, governed by net.ipv4.igmp_max_msf) --
+ * that only heal after operator action: re-probe on a long cadence so a
+ * raised cap is picked up without waiting for membership churn, without
+ * hot-spinning a failure that cannot resolve itself.
+ */
+#define AMT_UPSTREAM_RETRY_FAST		BIT(0)
+#define AMT_UPSTREAM_RETRY_SLOW		BIT(1)
+#define AMT_UPSTREAM_REPROBE		(60 * HZ)
+
+/* Reconcile the host stack's memberships toward the desired-state
+ * table. Single-instance by construction (one work item never runs
+ * concurrently with itself), and the only context that frees entries
+ * besides the destructor -- which runs strictly after
+ * cancel_delayed_work_sync. That exclusivity is what makes dropping
+ * upstream_lock around the sleeping setsockopt safe: concurrent
+ * amt_upstream_adjust calls may insert entries or change want, but
+ * never free, so the walk cursor stays valid. An entry inserted at a
+ * bucket head behind the cursor is caught by the follow-up pass that
+ * adjust's kick schedules (re-arming a work item while it executes
+ * queues another run).
+ *
+ * A failed emit arms a retry: 1s for transients, a 60s re-probe for
+ * the administrative source-filter cap (see the retry-class defines
+ * above), so both heal without waiting for membership churn. A
+ * stream_dev down window parks the work instead (upstream_active
+ * false); NETDEV_UP re-kicks it.
+ */
+static void amt_upstream_reconcile(struct work_struct *work)
+{
+	struct amt_dev *amt = container_of(to_delayed_work(work),
+					   struct amt_dev, upstream_work);
+	struct amt_upstream_entry *e;
+	unsigned int retry = 0;
+	struct hlist_node *t;
+	int bkt;
+
+	if (!READ_ONCE(amt->upstream_active))
+		return;
+
+	spin_lock_bh(&amt->upstream_lock);
+	hash_for_each_safe(amt->upstream, bkt, t, e, node) {
+		for (;;) {
+			union amt_addr grp, src;
+			enum amt_upstream_op op;
+			int err;
+
+			if (e->want == 0 && !e->joined) {
+				hash_del(&e->node);
+				kfree(e);
+				break;
+			}
+			if (!!e->want == e->joined)
+				break;
+			op = e->joined ? AMT_UPSTREAM_LEAVE : AMT_UPSTREAM_JOIN;
+			grp = e->group;
+			src = e->source;
+			spin_unlock_bh(&amt->upstream_lock);
+			err = amt_upstream_emit(amt, e->v6, &grp, &src, op);
+			spin_lock_bh(&amt->upstream_lock);
+			if (err) {
+				retry |= err == -ENOBUFS ?
+					 AMT_UPSTREAM_RETRY_SLOW :
+					 AMT_UPSTREAM_RETRY_FAST;
+				amt_upstream_warn_reconcile(amt, e->v6, op, err);
+				break;
+			}
+			e->joined = (op == AMT_UPSTREAM_JOIN);
+		}
+	}
+	spin_unlock_bh(&amt->upstream_lock);
+
+	if (!retry || !READ_ONCE(amt->upstream_active))
+		return;
+	queue_delayed_work(amt_wq, &amt->upstream_work,
+			   retry & AMT_UPSTREAM_RETRY_FAST ?
+			   HZ : AMT_UPSTREAM_REPROBE);
+}
+
+/*
+ * Record a source node's upstream (S, G) interest transition.
+ *
+ * join=true (AMT_ACT_STATUS_FWD_NEW): idempotent per source node via
+ * upstream_joined -- the state machine re-applies FWD_NEW to every
+ * surviving source on each periodic report (that is how survivors are
+ * protected from amt_cleanup_srcs's OLD-reaping), so only the first
+ * application may count. Only INCLUDE-mode (SSM) sources register
+ * upstream interest.
+ *
+ * join=false (amt_destroy_source only): gated ONLY on upstream_joined
+ * -- deliberately not on filter_mode or upstream_active -- so a source
+ * that joined while the group was INCLUDE still releases its count
+ * when destroyed after an EXCLUDE flip, during amt_dev_stop teardown,
+ * or while stream_dev is down. No live status transition releases:
+ * NONE/NEW is mark-sweep scratch state (see amt_act_src), and every
+ * true end-of-forwarding passes through amt_destroy_source.
+ *
+ * Callers hold tunnel->lock; upstream_joined is source-node state
+ * under that lock. Only desired state is recorded here -- all
+ * emission belongs to the reconciler.
+ */
+static void amt_upstream_track(struct amt_dev *amt, struct amt_group_node *gnode,
+			       struct amt_source_node *snode, bool join)
+{
+	int delta;
+
+	if (join) {
+		if (snode->upstream_joined)
+			return;
+		if (gnode->filter_mode != MCAST_INCLUDE)
+			return;
+		delta = 1;
+	} else {
+		if (!snode->upstream_joined)
+			return;
+		delta = -1;
+	}
+
+#if IS_ENABLED(CONFIG_IPV6)
+	if (gnode->v6 && ipv6_addr_any(&snode->source_addr.ip6))
+		return;	/* malformed SSM */
+#endif
+
+	if (amt_upstream_adjust(amt, &gnode->group_addr, &snode->source_addr,
+				gnode->v6, delta))
+		/* Entry allocation failed (join only). Leave the node
+		 * unmarked so the next periodic FWD_NEW re-mark retries.
+		 */
+		return;
+
+	snode->upstream_joined = join;
+}
+
+/*
+ * Bring up the upstream membership plumbing. Called from amt_dev_open
+ * (relay mode only) under rtnl_lock. Idempotent across down/up cycles:
+ * stream_sock_v{4,6} are only (re-)created if NULL. Sockets persist
+ * across cycles and are released exclusively in amt_dev_destructor --
+ * see the header comment on amt_upstream_emit.
+ *
+ * Non-fatal: a failure to create either socket logs a warn and leaves
+ * upstream_active false (or true if the other family came up). The
+ * relay data path continues to work; only host-stack joins are skipped
+ * on the failed family. This avoids a partial-init failure mode that
+ * would force the user to ifdown/ifup just to retry.
+ */
+static void amt_upstream_setup_open(struct amt_dev *amt)
+{
+	int err;
+
+	if (!amt->stream_sock_v4) {
+		err = amt_upstream_sock_create(amt, PF_INET, &amt->stream_sock_v4);
+		if (err)
+			netdev_warn(amt->dev,
+				    "upstream: v4 sock create failed (%d)\n", err);
+	}
+
+#if IS_ENABLED(CONFIG_IPV6)
+	if (!amt->stream_sock_v6) {
+		err = amt_upstream_sock_create(amt, PF_INET6, &amt->stream_sock_v6);
+		if (err)
+			netdev_warn(amt->dev,
+				    "upstream: v6 sock create failed (%d)\n", err);
+	}
+#endif
+
+	if (amt->stream_sock_v4 || amt->stream_sock_v6) {
+		WRITE_ONCE(amt->upstream_active, true);
+		/* Drain anything left unconverged from a previous cycle
+		 * (e.g. releases recorded while stream_dev was down).
+		 */
+		amt_upstream_kick(amt);
+	} else {
+		netdev_warn(amt->dev,
+			    "upstream: both v4 and v6 sock create failed; emit disabled\n");
+	}
+}
+
+/* Shared by amt_dev_init() and the KUnit cases. */
+static void amt_upstream_init(struct amt_dev *amt)
+{
+	spin_lock_init(&amt->upstream_lock);
+	INIT_DELAYED_WORK(&amt->upstream_work, amt_upstream_reconcile);
+	hash_init(amt->upstream);
+}
+
+/* Free every desired-state entry. The reconciler must not be running. */
+static void amt_upstream_free_entries(struct amt_dev *amt)
+{
+	struct amt_upstream_entry *e;
+	struct hlist_node *t;
+	int bkt;
+
+	spin_lock_bh(&amt->upstream_lock);
+	hash_for_each_safe(amt->upstream, bkt, t, e, node) {
+		hash_del(&e->node);
+		kfree(e);
+	}
+	spin_unlock_bh(&amt->upstream_lock);
+}
+
+static ssize_t upstream_setsockopt_slow_count_show(struct device *dev,
+						   struct device_attribute *attr,
+						   char *buf)
+{
+	struct net_device *netdev = to_net_dev(dev);
+	struct amt_dev *amt = netdev_priv(netdev);
+
+	return sysfs_emit(buf, "%u\n",
+		atomic_read(&amt->upstream_setsockopt_slow_count));
+}
+static DEVICE_ATTR_RO(upstream_setsockopt_slow_count);
+
+static struct attribute *amt_upstream_attrs[] = {
+	&dev_attr_upstream_setsockopt_slow_count.attr,
+	NULL,
+};
+
+static const struct attribute_group amt_upstream_group = {
+	.name = "upstream",
+	.attrs = amt_upstream_attrs,
 };
 
 static int amt_dev_init(struct net_device *dev)
@@ -3336,7 +3847,47 @@ static int amt_dev_init(struct net_device *dev)
 		return err;
 	}
 
+	amt_upstream_init(amt);
+
 	return 0;
+}
+
+/*
+ * Called from netdev_run_todo AFTER rtnl is dropped. This is where we:
+ *   1. cancel_delayed_work_sync the reconciler (an in-flight pass
+ *      completes; nothing can re-arm it afterwards -- the netdev is
+ *      unregistered, so no decap path remains to record changes)
+ *   2. sock_release the membership-carrying sockets (takes rtnl
+ *      internally inside ip_mc_drop_socket / ipv6_sock_mc_close on the
+ *      kernels we target -- safe here because we are post-rtnl)
+ *   3. Free the desired-state tables
+ *
+ * Ordering matters: the work cancel comes FIRST so no reconciler is
+ * mid-setsockopt (or holding an entry pointer) when the sockets are
+ * released and the tables freed. sock_release itself drops any
+ * memberships the host stack still holds, so unconverged entries need
+ * no emitted LEAVEs here.
+ */
+static void amt_dev_destructor(struct net_device *dev)
+{
+	struct amt_dev *amt = netdev_priv(dev);
+
+	/* Note: sysfs cleanup is handled by device_type::groups auto-removal at
+	 * device_del() (inside unregister_netdevice). Do NOT call
+	 * sysfs_remove_group(&dev->dev.kobj, ...) here — by the time
+	 * priv_destructor runs in netdev_run_todo, kobj->sd is already NULL and
+	 * the kernfs lookup OOPSes. See amt_type::groups wiring.
+	 */
+	cancel_delayed_work_sync(&amt->upstream_work);
+
+	if (amt->stream_sock_v4)
+		sock_release(amt->stream_sock_v4);
+	if (amt->stream_sock_v6)
+		sock_release(amt->stream_sock_v6);
+	amt->stream_sock_v4 = NULL;
+	amt->stream_sock_v6 = NULL;
+
+	amt_upstream_free_entries(amt);
 }
 
 static void amt_dev_uninit(struct net_device *dev)
@@ -3360,6 +3911,7 @@ static void amt_link_setup(struct net_device *dev)
 {
 	dev->netdev_ops         = &amt_netdev_ops;
 	dev->needs_free_netdev  = true;
+	dev->priv_destructor    = amt_dev_destructor;
 	SET_NETDEV_DEVTYPE(dev, &amt_type);
 	dev->min_mtu		= ETH_MIN_MTU;
 	dev->max_mtu		= ETH_MAX_MTU;
@@ -3580,6 +4132,11 @@ static int amt_newlink(struct net_device *dev,
 		goto err;
 	}
 
+	/* No explicit sysfs_create_group here: amt_type::groups auto-creates the
+	 * "upstream/" group inside register_netdevice's device_add(), and
+	 * unregister_netdevice's device_del() removes it. Explicit pairing is
+	 * race-prone — see amt_dev_destructor comment.
+	 */
 	err = netdev_upper_dev_link(amt->stream_dev, dev, extack);
 	if (err < 0) {
 		unregister_netdevice(dev);
@@ -3741,6 +4298,32 @@ static int amt_device_event(struct notifier_block *unused,
 			new_mtu = dev->mtu - AMT_GW_HLEN;
 
 		dev_set_mtu(amt->dev, new_mtu);
+		break;
+	case NETDEV_DOWN:
+		/* stream_dev went down: park the reconciler so it stops
+		 * issuing setsockopt calls that would fail and spin the
+		 * retry backoff. Desired-state recording continues -- a
+		 * last-gateway leave arriving in the down window still
+		 * decrements want, and the socket memberships persist
+		 * across a device down/up (they are per-socket state; the
+		 * host stack re-reports them on up), so actual state stays
+		 * accurate too. NETDEV_UP resumes and reconciles whatever
+		 * accumulated.
+		 */
+		netdev_info(amt->dev,
+			    "upstream: stream_dev %s went DOWN; pausing upstream reconcile\n",
+			    dev->name);
+		WRITE_ONCE(amt->upstream_active, false);
+		break;
+	case NETDEV_UP:
+		/* stream_dev is usable again: resume and immediately
+		 * reconcile changes recorded during the down window.
+		 */
+		netdev_info(amt->dev,
+			    "upstream: stream_dev %s came UP; resuming upstream reconcile\n",
+			    dev->name);
+		WRITE_ONCE(amt->upstream_active, true);
+		amt_upstream_kick(amt);
 		break;
 	}
 
