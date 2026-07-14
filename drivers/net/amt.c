@@ -4334,6 +4334,335 @@ static struct notifier_block amt_notifier_block __read_mostly = {
 	.notifier_call = amt_device_event,
 };
 
+#if IS_ENABLED(CONFIG_AMT_KUNIT_TEST)
+#include <kunit/test.h>
+
+/*
+ * KUnit coverage for relay-mode upstream membership tracking. The cases
+ * exercise the driver's internal (static) state and helpers, so the
+ * suite is compiled into amt.ko under CONFIG_AMT_KUNIT_TEST rather than
+ * living in a separate translation unit. Emission is deliberately out
+ * of scope: all cases run with upstream_active == false, so a kicked
+ * reconciler returns without touching the desired-state table and the
+ * cases can assert on it synchronously. That doubles as coverage that
+ * release recording is not gated on upstream_active (the amt_dev_stop /
+ * stream_dev-down paths depend on that).
+ */
+
+static int amt_upstream_test_want(struct amt_dev *amt, __be32 grp, __be32 src)
+{
+	union amt_addr g = {0}, s = {0};
+	struct amt_upstream_entry *e;
+	int want = 0;
+
+	g.ip4 = grp;
+	s.ip4 = src;
+	spin_lock_bh(&amt->upstream_lock);
+	e = amt_upstream_find(amt, &g, &s, false);
+	if (e)
+		want = e->want;
+	spin_unlock_bh(&amt->upstream_lock);
+	return want;
+}
+
+static struct amt_group_node *
+amt_test_group_alloc(struct amt_dev *amt, struct amt_tunnel_list *tunnel,
+		     __be32 group)
+{
+	struct amt_group_node *gnode;
+	int i;
+
+	gnode = kzalloc(sizeof(*gnode) +
+			(sizeof(struct hlist_head) * amt->hash_buckets),
+			GFP_KERNEL);
+	if (!gnode)
+		return NULL;
+
+	for (i = 0; i < amt->hash_buckets; i++)
+		INIT_HLIST_HEAD(&gnode->sources[i]);
+
+	spin_lock_init(&tunnel->lock);
+	tunnel->amt = amt;
+	gnode->amt = amt;
+	gnode->v6 = false;
+	gnode->filter_mode = MCAST_INCLUDE;
+	gnode->tunnel_list = tunnel;
+	gnode->group_addr.ip4 = group;
+	INIT_DELAYED_WORK(&gnode->group_timer, amt_group_work);
+	return gnode;
+}
+
+static struct amt_source_node *
+amt_test_src_add(struct amt_tunnel_list *tunnel, struct amt_group_node *gnode,
+		 __be32 saddr)
+{
+	union amt_addr src = {0};
+	struct amt_source_node *snode;
+	u32 hash;
+
+	src.ip4 = saddr;
+	snode = amt_alloc_snode(gnode, &src);
+	if (!snode)
+		return NULL;
+	hash = amt_source_hash(tunnel, &snode->source_addr);
+	hlist_add_head_rcu(&snode->node, &gnode->sources[hash]);
+	tunnel->nr_sources++;
+	gnode->nr_sources++;
+	return snode;
+}
+
+/*
+ * Regression test for the 2026-05-25 amt_dev_destructor panic:
+ * sysfs_remove_group() on a netdev whose device_del() had already nulled
+ * kobj->sd -> NULL deref. alloc_netdev() initializes dev->dev but does NOT
+ * register it, leaving kobj->sd == NULL -- exactly the state priv_destructor
+ * sees after device_del() during unregister_netdevice. If the destructor
+ * touches any kobj-dependent API the case OOPSes (KUnit reports it as a
+ * failure); surviving means the destructor is safe on never-registered state.
+ */
+static void amt_lifecycle_test(struct kunit *test)
+{
+	struct net_device *test_dev;
+	struct amt_dev *amt;
+
+	test_dev = alloc_netdev(sizeof(*amt), "amtst%d",
+				NET_NAME_UNKNOWN, amt_link_setup);
+	KUNIT_ASSERT_NOT_NULL(test, test_dev);
+
+	amt = netdev_priv(test_dev);
+
+	/* amt_dev_init's upstream setup; everything else stays zeroed (a
+	 * never-opened device -- the scenario that hit the panic).
+	 */
+	amt_upstream_init(amt);
+
+	/* Deliberately do NOT register_netdevice(): we want kobj->sd == NULL. */
+	amt_dev_destructor(test_dev);
+	free_netdev(test_dev);
+
+	KUNIT_SUCCEED(test);
+}
+
+/*
+ * Regression test for the periodic-refresh over-count. The state machine
+ * re-applies AMT_ACT_STATUS_FWD_NEW to every surviving INCLUDE source on
+ * each current-state report (that is how survivors are protected from
+ * amt_cleanup_srcs's OLD-reaping), so the re-application must NOT record
+ * another count of upstream interest, and the final destroy must return
+ * the count to exactly zero. Pre-fix, want grew by one per report and the
+ * last-contributor release could never reach zero, stranding the
+ * host-stack membership forever.
+ */
+static void amt_upstream_refresh_idempotent_test(struct kunit *test)
+{
+	struct amt_tunnel_list tunnel = {0};
+	struct amt_group_node *gnode;
+	struct amt_source_node *snode;
+	struct net_device *test_dev;
+	struct amt_dev *amt;
+	__be32 group = htonl(0xe8630001);	/* 232.99.0.1 */
+	__be32 source = htonl(0x0a000001);	/* 10.0.0.1 */
+
+	test_dev = alloc_netdev(sizeof(*amt), "amtrf%d",
+				NET_NAME_UNKNOWN, amt_link_setup);
+	KUNIT_ASSERT_NOT_NULL(test, test_dev);
+	amt = netdev_priv(test_dev);
+	amt->dev = test_dev;
+	amt_upstream_init(amt);
+	amt->hash_buckets = 8;
+
+	gnode = amt_test_group_alloc(amt, &tunnel, group);
+	KUNIT_ASSERT_NOT_NULL(test, gnode);
+	snode = amt_test_src_add(&tunnel, gnode, source);
+	KUNIT_ASSERT_NOT_NULL(test, snode);
+
+	/* First report: the source enters forwarding -> one count. */
+	amt_act_src(&tunnel, gnode, snode, AMT_ACT_STATUS_FWD_NEW);
+	KUNIT_EXPECT_EQ(test, amt_upstream_test_want(amt, group, source), 1);
+	KUNIT_EXPECT_TRUE(test, snode->upstream_joined);
+
+	amt_cleanup_srcs(amt, &tunnel, gnode);	/* NEW -> OLD */
+
+	/* Refresh reports re-mark the survivor: still one count. */
+	amt_act_src(&tunnel, gnode, snode, AMT_ACT_STATUS_FWD_NEW);
+	amt_cleanup_srcs(amt, &tunnel, gnode);
+	amt_act_src(&tunnel, gnode, snode, AMT_ACT_STATUS_FWD_NEW);
+	KUNIT_EXPECT_EQ(test, amt_upstream_test_want(amt, group, source), 1);
+
+	/* The only contributor going away zeroes the count exactly. */
+	amt_destroy_source(snode);
+	KUNIT_EXPECT_EQ(test, amt_upstream_test_want(amt, group, source), 0);
+	KUNIT_EXPECT_FALSE(test, snode->upstream_joined);
+
+	if (cancel_delayed_work_sync(&gnode->group_timer))
+		dev_put(amt->dev);
+	kfree(gnode);
+	__amt_source_gc_work();
+	amt_upstream_free_entries(amt);
+	cancel_delayed_work_sync(&amt->upstream_work);
+	free_netdev(test_dev);
+}
+
+static void amt_ex_transition_run_case(struct kunit *test, struct amt_dev *amt,
+				       bool to_ex)
+{
+	struct {
+		struct igmpv3_grec grec;
+		__be32 srcs[1];
+	} report;
+	struct amt_tunnel_list tunnel = {0};
+	struct amt_group_node *gnode;
+	struct amt_source_node *snode_drop, *snode_keep;
+	const char *name;
+	__be32 group;
+	__be32 drop_src;
+	__be32 keep_src;
+
+	name = to_ex ? "TO_EX" : "IS_EX";
+	group = htonl(0xe8630001);	/* 232.99.0.1 */
+	drop_src = htonl(0x0a000001);	/* in A only, so A-B: 10.0.0.1 */
+	keep_src = htonl(0x0a000002);	/* in A and B, so A*B: 10.0.0.2 */
+
+	gnode = amt_test_group_alloc(amt, &tunnel, group);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, gnode, "%s gnode alloc", name);
+	snode_drop = amt_test_src_add(&tunnel, gnode, drop_src);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, snode_drop, "%s drop snode alloc", name);
+	snode_keep = amt_test_src_add(&tunnel, gnode, keep_src);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, snode_keep, "%s keep snode alloc", name);
+
+	/* Both sources join in INCLUDE mode, then age to OLD -- the
+	 * established steady state before the EXCLUDE report arrives.
+	 */
+	amt_act_src(&tunnel, gnode, snode_drop, AMT_ACT_STATUS_FWD_NEW);
+	amt_act_src(&tunnel, gnode, snode_keep, AMT_ACT_STATUS_FWD_NEW);
+	amt_cleanup_srcs(amt, &tunnel, gnode);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, drop_src), 1,
+			    "%s drop_src joined", name);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, keep_src), 1,
+			    "%s keep_src joined", name);
+
+	/* EXCLUDE report carrying only keep_src: A*B = {keep}, A-B = {drop}. */
+	memset(&report, 0, sizeof(report));
+	report.grec.grec_nsrcs = htons(1);
+	report.grec.grec_mca = group;
+	report.grec.grec_src[0] = keep_src;
+
+	if (to_ex)
+		amt_mcast_to_ex_handler(amt, &tunnel, gnode, &report.grec,
+					&igmpv3_zero_grec, false);
+	else
+		amt_mcast_is_ex_handler(amt, &tunnel, gnode, &report.grec,
+					&igmpv3_zero_grec, false);
+
+	KUNIT_EXPECT_EQ_MSG(test, gnode->filter_mode, MCAST_EXCLUDE,
+			    "%s flip filter_mode to EXCLUDE", name);
+	/* The handler's A*B FWD_NEW pass must NOT record a second count
+	 * for the surviving join (pre-fix it did, stranding the entry at
+	 * a count its release could never zero).
+	 */
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, keep_src), 1,
+			    "%s A*B pass over-counted keep_src", name);
+
+	/* Cleanup destroys A-B; its count must drop with it even though
+	 * the group is EXCLUDE by now.
+	 */
+	amt_cleanup_srcs(amt, &tunnel, gnode);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, drop_src), 0,
+			    "%s A-B released on cleanup", name);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, keep_src), 1,
+			    "%s A*B survives cleanup", name);
+	KUNIT_EXPECT_EQ_MSG(test, gnode->nr_sources, 1,
+			    "%s A*B kept in group", name);
+
+	/* An IS_IN current-state report arriving while the group is still
+	 * EXCLUDE mark-sweeps the survivor through NONE/NEW and back to
+	 * FWD/NEW. The scratch mark must NOT release the INCLUDE-era join
+	 * -- the re-mark could not restore it (join is INCLUDE-gated), so
+	 * a release here would blackhole the still-interested receiver
+	 * for the rest of the EXCLUDE window.
+	 */
+	amt_mcast_is_in_handler(amt, &tunnel, gnode, &report.grec,
+				&igmpv3_zero_grec, false);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, keep_src), 1,
+			    "%s IS_IN-in-EXCLUDE dropped the join", name);
+	KUNIT_EXPECT_TRUE_MSG(test, snode_keep->upstream_joined,
+			      "%s IS_IN-in-EXCLUDE cleared the flag", name);
+	amt_cleanup_srcs(amt, &tunnel, gnode);
+	KUNIT_EXPECT_EQ_MSG(test, gnode->nr_sources, 1,
+			    "%s survivor destroyed by IS_IN mark-sweep", name);
+
+	/* Destroying the survivor while the group is EXCLUDE must still
+	 * release its INCLUDE-era join -- pre-fix this was a terminal
+	 * leak (the release was gated on filter_mode == INCLUDE).
+	 */
+	amt_destroy_source(snode_keep);
+	KUNIT_EXPECT_EQ_MSG(test,
+			    amt_upstream_test_want(amt, group, keep_src), 0,
+			    "%s EXCLUDE-mode destroy releases", name);
+
+	if (cancel_delayed_work_sync(&gnode->group_timer))
+		dev_put(amt->dev);
+	kfree(gnode);
+	amt_upstream_free_entries(amt);
+}
+
+/*
+ * Regression test for the INCLUDE->EXCLUDE transition accounting. The
+ * IS_EX/TO_EX handlers re-mark the surviving A*B sources FWD_NEW while
+ * filter_mode is still INCLUDE and defer the A-B deletions to
+ * amt_cleanup_srcs, which runs after the flip. Both sides went wrong
+ * pre-fix: the A*B re-mark double-counted the surviving join, and the
+ * post-flip A-B destroy (and any later EXCLUDE-mode destroy) skipped
+ * the release because it was gated on filter_mode. Drive both handlers
+ * and assert exact counts at every step.
+ */
+static void amt_ex_transition_test(struct kunit *test)
+{
+	struct net_device *test_dev;
+	struct amt_dev *amt;
+
+	test_dev = alloc_netdev(sizeof(*amt), "amtex%d",
+				NET_NAME_UNKNOWN, amt_link_setup);
+	KUNIT_ASSERT_NOT_NULL(test, test_dev);
+	amt = netdev_priv(test_dev);
+	amt->dev = test_dev;
+
+	amt_upstream_init(amt);
+	amt->hash_buckets = 8;
+	amt->qrv = 2;
+	amt->qi = 125;
+	amt->qri = 10;
+
+	amt_ex_transition_run_case(test, amt, false);
+	amt_ex_transition_run_case(test, amt, true);
+
+	cancel_delayed_work_sync(&amt->upstream_work);
+	__amt_source_gc_work();
+
+	free_netdev(test_dev);
+}
+
+static struct kunit_case amt_test_cases[] = {
+	KUNIT_CASE(amt_lifecycle_test),
+	KUNIT_CASE(amt_upstream_refresh_idempotent_test),
+	KUNIT_CASE(amt_ex_transition_test),
+	{}
+};
+
+static struct kunit_suite amt_test_suite = {
+	.name = "amt",
+	.test_cases = amt_test_cases,
+};
+
+kunit_test_suite(amt_test_suite);
+#endif /* CONFIG_AMT_KUNIT_TEST */
+
 static int __init amt_init(void)
 {
 	int err;
