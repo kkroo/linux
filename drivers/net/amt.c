@@ -94,6 +94,14 @@ static unsigned int amt_ip_hlen(const struct amt_dev *amt)
 	return amt_v6(amt) ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
 }
 
+/* Headroom the device reserves for its outer encapsulation. */
+static unsigned int amt_hlen(const struct amt_dev *amt)
+{
+	if (amt->mode == AMT_MODE_RELAY)
+		return AMT_RELAY_HLEN;
+	return amt_v6(amt) ? AMT_GW_HLEN6 : AMT_GW_HLEN;
+}
+
 /* Snapshot the outer source address of a received AMT message. */
 static void amt_outer_saddr(const struct amt_dev *amt,
 			    const struct sk_buff *skb, union amt_addr *addr)
@@ -3945,6 +3953,8 @@ static const struct nla_policy amt_policy[IFLA_AMT_MAX + 1] = {
 	[IFLA_AMT_HASH_BUCKETS]	= NLA_POLICY_MAX(NLA_U32, 4096),
 	[IFLA_AMT_MAX_GROUPS]	= NLA_POLICY_MAX(NLA_U32, 4096),
 	[IFLA_AMT_NUM_QUEUES]	= NLA_POLICY_MAX(NLA_U32, AMT_MAX_QUEUES),
+	[IFLA_AMT_DISCOVERY_IP6] = NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+	[IFLA_AMT_REMOTE_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 };
 
 static int amt_validate(struct nlattr *tb[], struct nlattr *data[],
@@ -3983,17 +3993,32 @@ static int amt_validate(struct nlattr *tb[], struct nlattr *data[],
 		return -EINVAL;
 	}
 
-	if (data[IFLA_AMT_LOCAL_IP6] &&
-	    nla_get_u32(data[IFLA_AMT_MODE]) == AMT_MODE_GATEWAY) {
-		NL_SET_ERR_MSG_ATTR(extack, data[IFLA_AMT_LOCAL_IP6],
-				    "Local IPv6 is only supported in relay mode");
-		return -EINVAL;
-	}
+	/* Gateway mode drives a v6 outer transport end to end: a v6 local is
+	 * paired with a v6 discovery, a v4 local with a v4 discovery. Reject a
+	 * mixed-family gateway and a discovery in the wrong mode.
+	 */
+	if (nla_get_u32(data[IFLA_AMT_MODE]) == AMT_MODE_GATEWAY) {
+		bool local6 = !!data[IFLA_AMT_LOCAL_IP6];
+		bool disc6 = !!data[IFLA_AMT_DISCOVERY_IP6];
 
-	if (!data[IFLA_AMT_DISCOVERY_IP] &&
-	    nla_get_u32(data[IFLA_AMT_MODE]) == AMT_MODE_GATEWAY) {
-		NL_SET_ERR_MSG_ATTR(extack, data[IFLA_AMT_LOCAL_IP],
-				    "Discovery attribute is required");
+		if (!data[IFLA_AMT_DISCOVERY_IP] && !disc6) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Discovery attribute is required");
+			return -EINVAL;
+		}
+		if (data[IFLA_AMT_DISCOVERY_IP] && disc6) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Discovery IPv4 and IPv6 are mutually exclusive");
+			return -EINVAL;
+		}
+		if (local6 != disc6) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Gateway local and discovery must be the same family");
+			return -EINVAL;
+		}
+	} else if (data[IFLA_AMT_DISCOVERY_IP6]) {
+		NL_SET_ERR_MSG_ATTR(extack, data[IFLA_AMT_DISCOVERY_IP6],
+				    "Discovery IPv6 is only valid in gateway mode");
 		return -EINVAL;
 	}
 
@@ -4086,31 +4111,46 @@ static int amt_newlink(struct net_device *dev,
 		dev->max_mtu = dev->mtu;
 		dev->min_mtu = ETH_MIN_MTU + AMT_RELAY_HLEN;
 	} else {
-		if (!data[IFLA_AMT_DISCOVERY_IP]) {
-			NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP],
-					    "discovery must be set in gateway mode");
-			goto err;
-		}
 		if (!amt->gw_port) {
 			NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP],
 					    "gateway port must not be 0");
 			goto err;
 		}
-		WRITE_ONCE(amt->remote_ip, 0);
-		amt->discovery_ip = nla_get_in_addr(data[IFLA_AMT_DISCOVERY_IP]);
-		if (ipv4_is_loopback(amt->discovery_ip) ||
-		    ipv4_is_zeronet(amt->discovery_ip) ||
-		    ipv4_is_multicast(amt->discovery_ip)) {
-			NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP],
-					    "discovery must be unicast");
-			goto err;
+#if IS_ENABLED(CONFIG_IPV6)
+		if (data[IFLA_AMT_DISCOVERY_IP6]) {
+			amt->remote_ipv6 = in6addr_any;
+			amt->discovery_ipv6 = nla_get_in6_addr(data[IFLA_AMT_DISCOVERY_IP6]);
+			if (ipv6_addr_loopback(&amt->discovery_ipv6) ||
+			    ipv6_addr_any(&amt->discovery_ipv6) ||
+			    ipv6_addr_is_multicast(&amt->discovery_ipv6)) {
+				NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP6],
+						    "discovery must be unicast");
+				goto err;
+			}
+		} else
+#endif
+		{
+			if (!data[IFLA_AMT_DISCOVERY_IP]) {
+				NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP],
+						    "discovery must be set in gateway mode");
+				goto err;
+			}
+			WRITE_ONCE(amt->remote_ip, 0);
+			amt->discovery_ip = nla_get_in_addr(data[IFLA_AMT_DISCOVERY_IP]);
+			if (ipv4_is_loopback(amt->discovery_ip) ||
+			    ipv4_is_zeronet(amt->discovery_ip) ||
+			    ipv4_is_multicast(amt->discovery_ip)) {
+				NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_AMT_DISCOVERY_IP],
+						    "discovery must be unicast");
+				goto err;
+			}
 		}
 
 		dev->needed_headroom = amt->stream_dev->needed_headroom +
-				       AMT_GW_HLEN;
-		dev->mtu = amt->stream_dev->mtu - AMT_GW_HLEN;
+				       amt_hlen(amt);
+		dev->mtu = amt->stream_dev->mtu - amt_hlen(amt);
 		dev->max_mtu = dev->mtu;
-		dev->min_mtu = ETH_MIN_MTU + AMT_GW_HLEN;
+		dev->min_mtu = ETH_MIN_MTU + amt_hlen(amt);
 	}
 	amt->qi = AMT_INIT_QUERY_INTERVAL;
 
@@ -4178,7 +4218,9 @@ static size_t amt_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_DISCOVERY_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_REMOTE_IP */
 	       nla_total_size(sizeof(__be32)) + /* IFLA_AMT_LOCAL_IP */
-	       nla_total_size(sizeof(struct in6_addr)); /* IFLA_AMT_LOCAL_IP6 */
+	       nla_total_size(sizeof(struct in6_addr)) + /* IFLA_AMT_LOCAL_IP6 */
+	       nla_total_size(sizeof(struct in6_addr)) + /* IFLA_AMT_DISCOVERY_IP6 */
+	       nla_total_size(sizeof(struct in6_addr)); /* IFLA_AMT_REMOTE_IP6 */
 }
 
 static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
@@ -4195,29 +4237,32 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_LINK, amt->stream_dev->ifindex))
 		goto nla_put_failure;
-	/* Emit exactly one of LOCAL_IP / LOCAL_IP6 -- whichever family the
-	 * relay was created with. amt_newlink rejects both being set, so
-	 * exactly one is meaningful. Userspace tools (iproute2 `ip -d link
-	 * show`) read the attribute back to decide which family the relay
-	 * is in; if we always emitted LOCAL_IP, a v6 relay would advertise
-	 * local 0.0.0.0 and `ip link` would silently render it as a v4
-	 * relay.
-	 */
 	if (amt_v6(amt)) {
-		if (nla_put_in6_addr(skb, IFLA_AMT_LOCAL_IP6,
-				     &amt->local_ipv6))
+		if (nla_put_in6_addr(skb, IFLA_AMT_LOCAL_IP6, &amt->local_ipv6))
 			goto nla_put_failure;
-	} else {
-		if (nla_put_in_addr(skb, IFLA_AMT_LOCAL_IP, amt->local_ip))
-			goto nla_put_failure;
+	} else if (nla_put_in_addr(skb, IFLA_AMT_LOCAL_IP, amt->local_ip)) {
+		goto nla_put_failure;
 	}
+#if IS_ENABLED(CONFIG_IPV6)
+	if (!ipv6_addr_any(&amt->discovery_ipv6)) {
+		if (nla_put_in6_addr(skb, IFLA_AMT_DISCOVERY_IP6,
+				     &amt->discovery_ipv6))
+			goto nla_put_failure;
+	} else
+#endif
 	if (nla_put_in_addr(skb, IFLA_AMT_DISCOVERY_IP, amt->discovery_ip))
 		goto nla_put_failure;
-
-	remote_ip = READ_ONCE(amt->remote_ip);
-	if (remote_ip)
-		if (nla_put_in_addr(skb, IFLA_AMT_REMOTE_IP, remote_ip))
+#if IS_ENABLED(CONFIG_IPV6)
+	if (!ipv6_addr_any(&amt->remote_ipv6)) {
+		if (nla_put_in6_addr(skb, IFLA_AMT_REMOTE_IP6, &amt->remote_ipv6))
 			goto nla_put_failure;
+	} else
+#endif
+	{
+		remote_ip = READ_ONCE(amt->remote_ip);
+		if (remote_ip && nla_put_in_addr(skb, IFLA_AMT_REMOTE_IP, remote_ip))
+			goto nla_put_failure;
+	}
 	if (nla_put_u32(skb, IFLA_AMT_MAX_TUNNELS, amt->max_tunnels))
 		goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_HASH_BUCKETS, amt->hash_buckets))
@@ -4292,11 +4337,7 @@ static int amt_device_event(struct notifier_block *unused,
 		unregister_netdevice_many(&list);
 		break;
 	case NETDEV_CHANGEMTU:
-		if (amt->mode == AMT_MODE_RELAY)
-			new_mtu = dev->mtu - AMT_RELAY_HLEN;
-		else
-			new_mtu = dev->mtu - AMT_GW_HLEN;
-
+		new_mtu = dev->mtu - amt_hlen(amt);
 		dev_set_mtu(amt->dev, new_mtu);
 		break;
 	case NETDEV_DOWN:

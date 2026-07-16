@@ -54,11 +54,11 @@ enum {
 	IFLA_AMT_DISCOVERY_IP,
 	/* This attribute specify number of maximum tunnel. */
 	IFLA_AMT_MAX_TUNNELS,
-	/* This attribute specify the local IPv6 address used by the relay
-	 * for AMT Discovery / Advertisement (RFC 7450 §5.1.2 v6 form).
-	 * Mutually exclusive with IFLA_AMT_LOCAL_IP — exactly one must be
-	 * supplied at link creation. Gateway-mode only uses IFLA_AMT_LOCAL_IP
-	 * today; v6 gateway support is out of scope.
+	/* This attribute specify the local IPv6 address used for AMT
+	 * Discovery / Advertisement (RFC 7450 §5.1.2 v6 form). Mutually
+	 * exclusive with IFLA_AMT_LOCAL_IP — exactly one must be supplied at
+	 * link creation. Used by both relay mode (the relay's listen address)
+	 * and gateway mode (the gateway's outer source address).
 	 */
 	IFLA_AMT_LOCAL_IP6,
 	/* This attribute specifies the number of hash buckets in each
@@ -83,6 +83,18 @@ enum {
 	 * AMT_MAX_QUEUES (the allocation reserves slots up front).
 	 */
 	IFLA_AMT_NUM_QUEUES,
+	/* IPv6 form of IFLA_AMT_DISCOVERY_IP: the relay's IPv6 address a v6
+	 * gateway sends AMT Discovery to. Gateway mode only; mutually
+	 * exclusive with IFLA_AMT_DISCOVERY_IP and paired with
+	 * IFLA_AMT_LOCAL_IP6 (a v6 gateway runs a v6 outer transport end to
+	 * end).
+	 */
+	IFLA_AMT_DISCOVERY_IP6,
+	/* IPv6 form of IFLA_AMT_REMOTE_IP: the relay's IPv6 address a v6
+	 * gateway learned from the Relay Advertisement. Read-only (emitted in
+	 * fill_info for `ip -d link show`), gateway mode only.
+	 */
+	IFLA_AMT_REMOTE_IP6,
 	__IFLA_AMT_MAX,
 };
 
