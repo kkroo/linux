@@ -427,6 +427,8 @@ struct amt_dev {
 	 * in6addr_any in v4 mode, mutually exclusive with remote_ip)
 	 */
 	struct in6_addr		remote_ipv6;
+	/* Publishes remote_ipv6, which is too wide for a single access */
+	seqlock_t		remote_ipv6_lock;
 	/* Outer discovery ip */
 	__be32			discovery_ip;
 	/* Outer discovery ipv6 (v6 gateway only; in6addr_any in v4 mode,

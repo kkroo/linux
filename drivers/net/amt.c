@@ -761,6 +761,30 @@ out:
 #endif
 
 #if IS_ENABLED(CONFIG_IPV6)
+/* The learned relay address is written by the event worker and read by the
+ * softirq RX and TX paths. A struct in6_addr cannot be stored or loaded in
+ * one access, so it is published under a seqlock, and every consumer takes
+ * one snapshot per packet.
+ */
+static void amt_set_remote_ipv6(struct amt_dev *amt,
+				const struct in6_addr *addr)
+{
+	write_seqlock_bh(&amt->remote_ipv6_lock);
+	amt->remote_ipv6 = *addr;
+	write_sequnlock_bh(&amt->remote_ipv6_lock);
+}
+
+static void amt_get_remote_ipv6(const struct amt_dev *amt,
+				struct in6_addr *addr)
+{
+	unsigned int seq;
+
+	do {
+		seq = read_seqbegin(&amt->remote_ipv6_lock);
+		*addr = amt->remote_ipv6;
+	} while (read_seqretry(&amt->remote_ipv6_lock, seq));
+}
+
 /* IPv6-outer variant of amt_send_discovery(). */
 static void amt_send_discovery_v6(struct amt_dev *amt)
 {
@@ -784,9 +808,11 @@ static void amt_send_request_v6(struct amt_dev *amt, bool v6)
 		.p	= v6,
 		.nonce	= amt->nonce,
 	};
+	struct in6_addr remote6;
 
-	amt_send_ctrl_v6(amt, &amt->remote_ipv6, amt->gw_port,
-			 amt->relay_port, &amtrh, sizeof(amtrh));
+	amt_get_remote_ipv6(amt, &remote6);
+	amt_send_ctrl_v6(amt, &remote6, amt->gw_port, amt->relay_port,
+			 &amtrh, sizeof(amtrh));
 }
 #endif
 
@@ -1175,6 +1201,9 @@ static void amt_event_send_request(struct amt_dev *amt)
 		WRITE_ONCE(amt->ready4, false);
 		WRITE_ONCE(amt->ready6, false);
 		WRITE_ONCE(amt->remote_ip, 0);
+#if IS_ENABLED(CONFIG_IPV6)
+		amt_set_remote_ipv6(amt, &in6addr_any);
+#endif
 		amt_update_gw_status(amt, AMT_STATUS_INIT, false);
 		amt->req_cnt = 0;
 		amt->nonce = 0;
@@ -1291,7 +1320,7 @@ static bool amt_send_membership_update(struct amt_dev *amt,
 		skb_set_inner_protocol(skb, htons(ETH_P_IPV6));
 #if IS_ENABLED(CONFIG_IPV6)
 	if (amt_v6(amt))
-		remote.ip6 = amt->remote_ipv6;
+		amt_get_remote_ipv6(amt, &remote.ip6);
 	else
 #endif
 		remote.ip4 = READ_ONCE(amt->remote_ip);
@@ -2444,27 +2473,42 @@ static bool amt_advertisement_handler(struct amt_dev *amt, struct sk_buff *skb)
 	struct amt_header_advertisement *amta;
 	int hdr_size;
 
-	hdr_size = sizeof(*amta) + sizeof(struct udphdr);
+	/* The IPv6 form (RFC 7450 s5.1.2) has the same header and nonce, with
+	 * a 16-byte relay address in place of ip4.
+	 */
+	hdr_size = sizeof(struct udphdr) +
+		   (amt_v6(amt) ? sizeof(struct amt_header_advertisement_v6) :
+				  sizeof(*amta));
 	if (!pskb_may_pull(skb, hdr_size))
 		return true;
 
 	amta = (struct amt_header_advertisement *)(udp_hdr(skb) + 1);
-	if (!amta->ip4)
-		return true;
-
 	if (amta->reserved || amta->version)
-		return true;
-
-	if (ipv4_is_loopback(amta->ip4) || ipv4_is_multicast(amta->ip4) ||
-	    ipv4_is_zeronet(amta->ip4))
 		return true;
 
 	if (amt->status != AMT_STATUS_SENT_DISCOVERY ||
 	    amt->nonce != amta->nonce)
 		return true;
 
-	WRITE_ONCE(amt->remote_ip, amta->ip4);
-	netdev_dbg(amt->dev, "advertised remote ip = %pI4\n", &amta->ip4);
+#if IS_ENABLED(CONFIG_IPV6)
+	if (amt_v6(amt)) {
+		const struct in6_addr *ip6;
+
+		ip6 = &((struct amt_header_advertisement_v6 *)amta)->ip6;
+		if (ipv6_addr_any(ip6) || ipv6_addr_loopback(ip6) ||
+		    ipv6_addr_is_multicast(ip6))
+			return true;
+		amt_set_remote_ipv6(amt, ip6);
+		netdev_dbg(amt->dev, "advertised remote ipv6 = %pI6c\n", ip6);
+	} else
+#endif
+	{
+		if (!amta->ip4 || ipv4_is_loopback(amta->ip4) ||
+		    ipv4_is_multicast(amta->ip4) || ipv4_is_zeronet(amta->ip4))
+			return true;
+		WRITE_ONCE(amt->remote_ip, amta->ip4);
+		netdev_dbg(amt->dev, "advertised remote ip = %pI4\n", &amta->ip4);
+	}
 	mod_delayed_work(amt_wq, &amt->req_wq, 0);
 
 	amt_update_gw_status(amt, AMT_STATUS_RECEIVED_ADVERTISEMENT, true);
@@ -3067,11 +3111,30 @@ drop:
 	}
 }
 
+/* Whether a message a gateway received came from its relay: the discovery
+ * address for an Advertisement, the learned relay address otherwise.
+ */
+static bool amt_from_relay(const struct amt_dev *amt,
+			   const struct sk_buff *skb, bool discovery)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (amt_v6(amt)) {
+		struct in6_addr relay;
+
+		if (discovery)
+			relay = amt->discovery_ipv6;
+		else
+			amt_get_remote_ipv6(amt, &relay);
+		return ipv6_addr_equal(&ipv6_hdr(skb)->saddr, &relay);
+	}
+#endif
+	return ip_hdr(skb)->saddr ==
+	       (discovery ? amt->discovery_ip : READ_ONCE(amt->remote_ip));
+}
+
 static int amt_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	struct amt_dev *amt;
-	__be32 remote_ip;
-	__be32 saddr;
 	int type;
 	bool err;
 
@@ -3082,10 +3145,7 @@ static int amt_rcv(struct sock *sk, struct sk_buff *skb)
 		kfree_skb(skb);
 		goto out;
 	}
-	remote_ip = READ_ONCE(amt->remote_ip);
-
 	skb->dev = amt->dev;
-	saddr = ip_hdr(skb)->saddr;
 	type = amt_parse_type(skb);
 	if (type == -1) {
 		err = true;
@@ -3095,7 +3155,7 @@ static int amt_rcv(struct sock *sk, struct sk_buff *skb)
 	if (amt->mode == AMT_MODE_GATEWAY) {
 		switch (type) {
 		case AMT_MSG_ADVERTISEMENT:
-			if (saddr != amt->discovery_ip) {
+			if (!amt_from_relay(amt, skb, true)) {
 				netdev_dbg(amt->dev, "Invalid Relay IP\n");
 				err = true;
 				goto drop;
@@ -3107,7 +3167,7 @@ static int amt_rcv(struct sock *sk, struct sk_buff *skb)
 			}
 			goto out;
 		case AMT_MSG_MULTICAST_DATA:
-			if (saddr != remote_ip) {
+			if (!amt_from_relay(amt, skb, false)) {
 				netdev_dbg(amt->dev, "Invalid Relay IP\n");
 				err = true;
 				goto drop;
@@ -3118,7 +3178,7 @@ static int amt_rcv(struct sock *sk, struct sk_buff *skb)
 			else
 				goto out;
 		case AMT_MSG_MEMBERSHIP_QUERY:
-			if (saddr != remote_ip) {
+			if (!amt_from_relay(amt, skb, false)) {
 				netdev_dbg(amt->dev, "Invalid Relay IP\n");
 				err = true;
 				goto drop;
@@ -4076,6 +4136,7 @@ static int amt_newlink(struct net_device *dev,
 		amt->max_tunnels = AMT_MAX_TUNNELS;
 
 	spin_lock_init(&amt->lock);
+	seqlock_init(&amt->remote_ipv6_lock);
 	/* Zero means the default for both, as for IFLA_AMT_MAX_TUNNELS. */
 	amt->max_groups = nla_get_u32_default(data[IFLA_AMT_MAX_GROUPS], 0) ?:
 			  AMT_MAX_GROUP;
@@ -4254,6 +4315,11 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	const struct amt_dev *amt = netdev_priv(dev);
 	__be32 remote_ip;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct in6_addr remote6;
+
+	amt_get_remote_ipv6(amt, &remote6);
+#endif
 
 	rcu_read_lock();
 	if (nla_put_u32(skb, IFLA_AMT_MODE, amt->mode))
@@ -4280,8 +4346,8 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 	if (nla_put_in_addr(skb, IFLA_AMT_DISCOVERY_IP, amt->discovery_ip))
 		goto nla_put_failure;
 #if IS_ENABLED(CONFIG_IPV6)
-	if (!ipv6_addr_any(&amt->remote_ipv6)) {
-		if (nla_put_in6_addr(skb, IFLA_AMT_REMOTE_IP6, &amt->remote_ipv6))
+	if (!ipv6_addr_any(&remote6)) {
+		if (nla_put_in6_addr(skb, IFLA_AMT_REMOTE_IP6, &remote6))
 			goto nla_put_failure;
 	} else
 #endif
