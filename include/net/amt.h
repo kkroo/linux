@@ -409,6 +409,8 @@ struct amt_dev {
 	u32			hash_seed;
 	/* Default 128 */
 	u32                     max_tunnels;
+	/* Default AMT_MAX_TUNNELS_PER_SOURCE */
+	u32                     max_tunnels_per_source;
 	/* Default 128 */
 	u32                     nr_tunnels;
 	/* Gateway or Relay mode */
@@ -501,6 +503,17 @@ struct amt_dev {
 #define AMT_SECRET_TIMEOUT	60000
 #define IANA_AMT_UDP_PORT	2268
 #define AMT_MAX_TUNNELS         128
+/* Per-outer-source-address tunnel bound. Tunnels are keyed on the
+ * (address, port) endpoint, so one host can otherwise consume the whole
+ * table from a single address by varying its source port -- no spoofing
+ * and no privilege required. This is deliberately well above realistic
+ * co-location behind one NAT (a redundant gateway pair, a handful of
+ * subscriber devices, or one gateway using separate ports for IGMP and
+ * MLD) and well below AMT_MAX_TUNNELS. A relay fronting CGNAT, where a
+ * legitimate subscriber population shares one address, must raise it via
+ * IFLA_AMT_MAX_TUNNELS_PER_SOURCE.
+ */
+#define AMT_MAX_TUNNELS_PER_SOURCE 16
 #define AMT_MAX_REQS		128
 /* Upper bound on TX/RX queues an amt netdev can be allocated with.
  * The actual live queue count is set per-link via IFLA_AMT_NUM_QUEUES

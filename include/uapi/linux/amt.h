@@ -95,6 +95,13 @@ enum {
 	 * fill_info for `ip -d link show`), gateway mode only.
 	 */
 	IFLA_AMT_REMOTE_IP6,
+	/* Relay mode: maximum concurrent tunnels admitted from any one outer
+	 * source address. Tunnels are keyed on the (address, port) endpoint,
+	 * so without this bound a single host can open the whole table from
+	 * one address by varying its source port. Default
+	 * AMT_MAX_TUNNELS_PER_SOURCE; raise it on a relay that fronts CGNAT.
+	 */
+	IFLA_AMT_MAX_TUNNELS_PER_SOURCE,
 	__IFLA_AMT_MAX,
 };
 

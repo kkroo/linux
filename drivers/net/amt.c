@@ -2970,6 +2970,7 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 	unsigned long long key;
 	union amt_addr saddr;
 	struct udphdr *udph;
+	u32 nr_source = 0;
 	u64 mac;
 
 	if (!pskb_may_pull(skb, sizeof(*udph) + sizeof(*amtrh)))
@@ -2983,6 +2984,9 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 		return true;
 
 	list_for_each_entry_rcu(tunnel, &amt->tunnel_list, list) {
+		if (!amt_addr_equal(&tunnel->addr, &saddr))
+			continue;
+
 		/* RFC 7450 s4.2.2: "an AMT tunnel is identified by the IP
 		 * address and UDP port pair used as the destination address
 		 * for sending encapsulated multicast IP datagrams to a
@@ -3006,13 +3010,43 @@ static bool amt_request_handler(struct amt_dev *amt, struct sk_buff *skb)
 		 * are then dropped as Invalid MAC -- while its handshake
 		 * still looks accepted. It simply never receives data.
 		 */
-		if (tunnel->source_port == udph->source &&
-		    amt_addr_equal(&tunnel->addr, &saddr))
+		if (tunnel->source_port == udph->source)
 			goto send;
+
+		/* A distinct endpoint behind the same source address.
+		 * Counted on this walk -- which already visits every tunnel,
+		 * so the bound below costs no extra traversal.
+		 */
+		nr_source++;
 	}
 
 	spin_lock_bh(&amt->lock);
-	if (amt->nr_tunnels >= amt->max_tunnels) {
+	/* Two bounds, both required. The global one caps the table; the
+	 * per-source one caps how much of it any single address may hold.
+	 *
+	 * Keying on the address alone used to make the second bound
+	 * implicit -- one address could never occupy more than one slot,
+	 * whatever it did. Keying on the endpoint is correct (see above)
+	 * but removes that accident, and RFC 7450 s5.3.3 asks for the
+	 * property back explicitly: a relay "SHOULD provide a
+	 * configuration option to limit the number of tunnel endpoints
+	 * that may be created for a single host address".
+	 *
+	 * This bounds the non-spoofing attacker, who is the reachable one:
+	 * 128 UDP sockets on one residential line otherwise fill the whole
+	 * table, with no privilege and no spoofing -- so it survives
+	 * BCP38/uRPF ingress filtering, which is what makes source
+	 * spoofing hard on most transit in the first place. A spoofing
+	 * attacker still reaches max_tunnels; that is a separate problem
+	 * and this does not claim to solve it.
+	 *
+	 * nr_source is read outside amt->lock, so concurrent Requests from
+	 * one address can overshoot the bound by the number of CPUs racing
+	 * here. That is acceptable: the bound is DoS hardening, not a
+	 * correctness invariant, and max_tunnels still holds exactly.
+	 */
+	if (amt->nr_tunnels >= amt->max_tunnels ||
+	    nr_source >= amt->max_tunnels_per_source) {
 		spin_unlock_bh(&amt->lock);
 #if IS_ENABLED(CONFIG_IPV6)
 		if (amt_v6(amt)) {
@@ -4036,6 +4070,7 @@ static const struct nla_policy amt_policy[IFLA_AMT_MAX + 1] = {
 	[IFLA_AMT_REMOTE_IP]	= { .len = sizeof_field(struct iphdr, daddr) },
 	[IFLA_AMT_DISCOVERY_IP]	= { .len = sizeof_field(struct iphdr, daddr) },
 	[IFLA_AMT_MAX_TUNNELS]	= { .type = NLA_U32 },
+	[IFLA_AMT_MAX_TUNNELS_PER_SOURCE] = { .type = NLA_U32 },
 	[IFLA_AMT_LOCAL_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[IFLA_AMT_HASH_BUCKETS]	= NLA_POLICY_MAX(NLA_U32, 4096),
 	[IFLA_AMT_MAX_GROUPS]	= NLA_POLICY_MAX(NLA_U32, 4096),
@@ -4134,6 +4169,10 @@ static int amt_newlink(struct net_device *dev,
 		amt->max_tunnels = nla_get_u32(data[IFLA_AMT_MAX_TUNNELS]);
 	else
 		amt->max_tunnels = AMT_MAX_TUNNELS;
+
+	amt->max_tunnels_per_source =
+		nla_get_u32_default(data[IFLA_AMT_MAX_TUNNELS_PER_SOURCE], 0) ?:
+		AMT_MAX_TUNNELS_PER_SOURCE;
 
 	spin_lock_init(&amt->lock);
 	seqlock_init(&amt->remote_ipv6_lock);
@@ -4300,6 +4339,7 @@ static size_t amt_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(__u16)) + /* IFLA_AMT_GATEWAY_PORT */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_LINK */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_MAX_TUNNELS */
+	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_MAX_TUNNELS_PER_SOURCE */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_HASH_BUCKETS */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_MAX_GROUPS */
 	       nla_total_size(sizeof(__u32)) + /* IFLA_AMT_NUM_QUEUES */
@@ -4357,6 +4397,9 @@ static int amt_fill_info(struct sk_buff *skb, const struct net_device *dev)
 			goto nla_put_failure;
 	}
 	if (nla_put_u32(skb, IFLA_AMT_MAX_TUNNELS, amt->max_tunnels))
+		goto nla_put_failure;
+	if (nla_put_u32(skb, IFLA_AMT_MAX_TUNNELS_PER_SOURCE,
+			amt->max_tunnels_per_source))
 		goto nla_put_failure;
 	if (nla_put_u32(skb, IFLA_AMT_HASH_BUCKETS, amt->hash_buckets))
 		goto nla_put_failure;
