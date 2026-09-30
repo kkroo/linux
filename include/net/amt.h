@@ -7,7 +7,9 @@
 
 #include <linux/siphash.h>
 #include <linux/jhash.h>
+#include <linux/hashtable.h>
 #include <linux/netdevice.h>
+#include <linux/rhashtable.h>
 #include <net/gro_cells.h>
 #include <net/rtnetlink.h>
 
@@ -133,6 +135,31 @@ struct amt_header_advertisement {
 	__be32	ip4;
 } __packed;
 
+/* RFC 7450 §5.1.2 Relay Advertisement message — IPv6 form.
+ *
+ * Same fixed 4-byte header and 4-byte Discovery Nonce as the IPv4
+ * variant (struct amt_header_advertisement above); the trailing
+ * Relay Address field is 16 bytes instead of 4. Total wire size:
+ * 4 + 4 + 16 = 24 bytes. Per §5.2 the form is selected from the
+ * outer IP version, not from any in-header marker, so this is a
+ * separate type rather than a union over amt_header_advertisement.
+ */
+struct amt_header_advertisement_v6 {
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	u32	type:4,
+		version:4,
+		reserved:24;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	u32	version:4,
+		type:4,
+		reserved:24;
+#else
+#error  "Please fix <asm/byteorder.h>"
+#endif
+	__be32		nonce;
+	struct in6_addr	ip6;
+} __packed;
+
 struct amt_header_request {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	u32	type:4,
@@ -231,9 +258,38 @@ struct amt_relay_headers {
 	};
 } __packed;
 
-struct amt_skb_cb {
-	struct amt_tunnel_list *tunnel;
+union amt_addr {
+	__be32			ip4;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct in6_addr		ip6;
+#endif
 };
+
+/* Upstream IGMPv3 / MLDv2 host-stack membership state. Sized for production
+ * relay scale (thousands of active (S, G) tuples possible).
+ */
+#define AMT_UPSTREAM_HASH_BITS	10
+
+/* One (S, G) of upstream interest. `want` is the DESIRED state: the
+ * number of source nodes currently contributing interest (many gateways
+ * may join the same (S, G)). `joined` is the ACTUAL state: whether the
+ * kernel host stack currently holds the membership on the stream
+ * socket. The reconciler worker converges joined toward (want > 0);
+ * both fields are protected by amt->upstream_lock. Entries are freed
+ * only by the reconciler (and the destructor, strictly after the
+ * worker is cancelled), so the reconciler may drop upstream_lock
+ * around the sleeping setsockopt while holding an entry pointer.
+ */
+struct amt_upstream_entry {
+	struct hlist_node	node;
+	union amt_addr		group;
+	union amt_addr		source;
+	bool			v6;
+	bool			joined;
+	int			want;
+};
+
+enum amt_upstream_op { AMT_UPSTREAM_JOIN, AMT_UPSTREAM_LEAVE };
 
 struct amt_tunnel_list {
 	struct list_head	list;
@@ -245,20 +301,17 @@ struct amt_tunnel_list {
 	enum amt_status		status;
 	struct delayed_work	gc_wq;
 	__be16			source_port;
-	__be32			ip4;
+	/* Outer source address of the gateway endpoint, in the device's
+	 * outer family (amt_v6()).
+	 */
+	union amt_addr		addr;
 	__be32			nonce;
 	siphash_key_t		key;
 	u64			mac:48,
 				reserved:16;
 	struct rcu_head		rcu;
-	struct hlist_head	groups[];
-};
-
-union amt_addr {
-	__be32			ip4;
-#if IS_ENABLED(CONFIG_IPV6)
-	struct in6_addr		ip6;
-#endif
+	/* This tunnel's entries in amt->groups_rhl, under lock */
+	struct list_head	groups;
 };
 
 /* RFC 3810
@@ -286,19 +339,35 @@ struct amt_source_node {
 #define AMT_SOURCE_OLD	0
 #define AMT_SOURCE_NEW	1
 	u8			flags;
+	/* Whether this source node currently contributes one count of
+	 * upstream host-stack (S, G) interest (amt_upstream_entry.want).
+	 * Set at most once per node lifetime on the first FWD_NEW while
+	 * the group is INCLUDE; cleared exactly once when the node is
+	 * destroyed. Makes the per-report FWD_NEW re-mark of surviving
+	 * sources idempotent and pairs every recorded join with exactly
+	 * one release, regardless of the group's filter mode at release
+	 * time.
+	 */
+	bool			upstream_joined;
 	struct rcu_head		rcu;
 };
 
 /* Protected by amt_tunnel_list->lock */
 struct amt_group_node {
 	struct amt_dev		*amt;
-	union amt_addr		group_addr;
+	/* Key in amt->groups_rhl; the hosts that joined a group through
+	 * one tunnel share a key.
+	 */
+	struct_group_tagged(amt_gnode_key, key,
+		struct amt_tunnel_list	*tunnel_list;
+		union amt_addr		group_addr;
+		bool			v6;
+	);
 	union amt_addr		host_addr;
-	bool			v6;
 	u8			filter_mode;
 	u32			nr_sources;
-	struct amt_tunnel_list	*tunnel_list;
-	struct hlist_node	node;
+	struct list_head	tunnel_node;
+	struct rhlist_head	rhlnode;
 	struct delayed_work     group_timer;
 	struct rcu_head		rcu;
 	struct hlist_head	sources[];
@@ -318,6 +387,8 @@ struct amt_dev {
 	spinlock_t		lock;
 	/* Used only in relay mode */
 	struct list_head        tunnel_list;
+	/* Groups joined through any tunnel, keyed by amt_gnode_key */
+	struct rhltable		groups_rhl;
 	struct gro_cells	gro_cells;
 
 	/* Protected by RTNL */
@@ -338,6 +409,8 @@ struct amt_dev {
 	u32			hash_seed;
 	/* Default 128 */
 	u32                     max_tunnels;
+	/* Default AMT_MAX_TUNNELS_PER_SOURCE */
+	u32                     max_tunnels_per_source;
 	/* Default 128 */
 	u32                     nr_tunnels;
 	/* Gateway or Relay mode */
@@ -348,10 +421,22 @@ struct amt_dev {
 	__be16			gw_port;
 	/* Outer local ip */
 	__be32			local_ip;
+	/* Outer local ipv6 (in6addr_any when v4 mode; mutually exclusive with local_ip) */
+	struct in6_addr		local_ipv6;
 	/* Outer remote ip */
 	__be32			remote_ip;
+	/* Outer remote ipv6 (learned from the v6 Relay Advertisement;
+	 * in6addr_any in v4 mode, mutually exclusive with remote_ip)
+	 */
+	struct in6_addr		remote_ipv6;
+	/* Publishes remote_ipv6, which is too wide for a single access */
+	seqlock_t		remote_ipv6_lock;
 	/* Outer discovery ip */
 	__be32			discovery_ip;
+	/* Outer discovery ipv6 (v6 gateway only; in6addr_any in v4 mode,
+	 * mutually exclusive with discovery_ip)
+	 */
+	struct in6_addr		discovery_ipv6;
 	/* Only used in gateway mode */
 	__be32			nonce;
 	/* Gateway sent request and received query */
@@ -368,6 +453,37 @@ struct amt_dev {
 	struct amt_events	events[AMT_MAX_EVENTS];
 	u8			event_idx;
 	u8			nr_events;
+
+	/* Upstream IGMPv3/MLDv2 host-stack membership state (relay mode).
+	 *
+	 * Relay mode mirrors gateway (S, G) interest as host-stack
+	 * memberships on the underlying stream_dev via setsockopt on
+	 * stream_sock_v{4,6}. The upstream table records DESIRED interest
+	 * (amt_upstream_entry.want, one count per contributing source
+	 * node) next to ACTUAL host-stack state (.joined); upstream_work
+	 * is a reconciler that converges actual toward desired in process
+	 * context, so the rtnl_lock taken internally by the IGMP/MLD
+	 * setsockopt paths (on the kernels we target) is never nested
+	 * inside a caller-held lock. A failed emit leaves the entry
+	 * unconverged and arms a delayed retry.
+	 *
+	 * upstream_lock protects the table; it is bh because desired
+	 * state changes arrive from the softirq decap path. The
+	 * reconciler is the only context that frees entries (destructor
+	 * aside, which runs strictly after the work is cancelled), so it
+	 * may drop upstream_lock around the sleeping setsockopt while
+	 * holding an entry pointer. upstream_active tracks whether
+	 * stream_dev is usable (cleared on NETDEV_DOWN, set on open/UP);
+	 * it pauses reconciliation but never desired-state recording, so
+	 * releases during a down window or device stop are not lost.
+	 */
+	spinlock_t		upstream_lock;
+	DECLARE_HASHTABLE(upstream, AMT_UPSTREAM_HASH_BITS);
+	bool			upstream_active;
+	struct delayed_work	upstream_work;
+	struct socket		*stream_sock_v4;
+	struct socket		*stream_sock_v6;
+	atomic_t		upstream_setsockopt_slow_count;
 };
 
 #define AMT_TOS			0xc0
@@ -387,10 +503,32 @@ struct amt_dev {
 #define AMT_SECRET_TIMEOUT	60000
 #define IANA_AMT_UDP_PORT	2268
 #define AMT_MAX_TUNNELS         128
+/* Per-outer-source-address tunnel bound. Tunnels are keyed on the
+ * (address, port) endpoint, so one host can otherwise consume the whole
+ * table from a single address by varying its source port -- no spoofing
+ * and no privilege required. This is deliberately well above realistic
+ * co-location behind one NAT (a redundant gateway pair, a handful of
+ * subscriber devices, or one gateway using separate ports for IGMP and
+ * MLD) and well below AMT_MAX_TUNNELS. A relay fronting CGNAT, where a
+ * legitimate subscriber population shares one address, must raise it via
+ * IFLA_AMT_MAX_TUNNELS_PER_SOURCE.
+ */
+#define AMT_MAX_TUNNELS_PER_SOURCE 16
 #define AMT_MAX_REQS		128
+/* Upper bound on TX/RX queues an amt netdev can be allocated with.
+ * The actual live queue count is set per-link via IFLA_AMT_NUM_QUEUES
+ * with a default of 1 (backwards-compatible). Picked to match a
+ * reasonable upper bound on per-relay parallelism; bigger numbers
+ * just waste alloc memory (a few hundred bytes per reserved slot).
+ */
+#define AMT_MAX_QUEUES		32
 #define AMT_GW_HLEN (sizeof(struct iphdr) + \
 		     sizeof(struct udphdr) + \
 		     sizeof(struct amt_gw_headers))
+/* IPv6-outer gateway headroom: the outer header is a struct ipv6hdr. */
+#define AMT_GW_HLEN6 (sizeof(struct ipv6hdr) + \
+		      sizeof(struct udphdr) + \
+		      sizeof(struct amt_gw_headers))
 #define AMT_RELAY_HLEN (sizeof(struct iphdr) + \
 		     sizeof(struct udphdr) + \
 		     sizeof(struct amt_relay_headers))

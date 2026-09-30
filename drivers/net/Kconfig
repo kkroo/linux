@@ -315,6 +315,24 @@ config AMT
 	  To compile this drivers as a module, choose M here: the module
 	  will be called amt.
 
+config AMT_KUNIT_TEST
+	tristate "AMT KUnit tests" if !KUNIT_ALL_TESTS
+	depends on AMT && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for the AMT driver's relay-mode upstream
+	  membership reconciler: priv_destructor safety on an unregistered
+	  netdev, join idempotency under periodic-report FWD_NEW re-marks,
+	  and exact join/release pairing across INCLUDE->EXCLUDE
+	  transitions and EXCLUDE-mode destroys. The tests live in the amt
+	  module and exercise its internal (static) state, so they build
+	  into amt.ko when enabled.
+
+	  For more information on KUnit and unit tests in general, please
+	  refer to the KUnit documentation in Documentation/dev-tools/kunit/.
+
+	  If unsure, say N.
+
 config MACSEC
 	tristate "IEEE 802.1AE MAC-level encryption (MACsec)"
 	select CRYPTO
